@@ -21,6 +21,24 @@ pub struct SpecialTokens {
 }
 
 /// A loaded WordPiece tokenizer.
+///
+/// ```no_run
+/// use burn_setfit::Tokenizer;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let tokenizer = Tokenizer::from_bytes(&std::fs::read("tokenizer.json")?)?;
+///
+/// // A complete model input: [CLS] ... [SEP], truncated to the budget.
+/// let ids = tokenizer.encode_full("The weather is lovely today.", 256)?;
+/// assert_eq!(ids[0], tokenizer.special_tokens().cls);
+/// assert_eq!(*ids.last().unwrap(), tokenizer.special_tokens().sep);
+///
+/// // Bare ids, for packing many segments into one window before wrapping once.
+/// let bare = tokenizer.encode_bare("The weather is lovely today.")?;
+/// assert_eq!(bare.len(), ids.len() - 2);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,

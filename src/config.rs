@@ -18,6 +18,33 @@ use crate::head::TaskMode;
 use crate::reduce::Reducer;
 
 /// How a trained model classifies.
+///
+/// ```
+/// use burn_setfit::{ChunkConfig, ClassifierConfig, Reducer};
+///
+/// let config = ClassifierConfig::new(["billing", "outage", "feature"])
+///     .multi_label_at(0.4)                              // threshold lives in the task
+///     .with_reducer(Reducer::MaxLogits)                 // else the task's default
+///     .with_chunking(ChunkConfig::new(256).with_overlap(32))
+///     .with_hierarchy(8);
+///
+/// assert_eq!(config.num_labels(), 3);
+/// assert_eq!(config.threshold(), Some(0.4));
+/// assert_eq!(config.label_index("outage"), Some(1));
+/// config.validate()?;
+/// # Ok::<(), burn_setfit::SetFitError>(())
+/// ```
+///
+/// Mistakes are refused rather than clamped, and the message names the culprit:
+///
+/// ```
+/// use burn_setfit::ClassifierConfig;
+///
+/// let err = ClassifierConfig::new(["spam", "ham", "spam"])
+///     .validate()
+///     .expect_err("two labels of the same name are ambiguous");
+/// assert!(format!("{err}").contains("spam"));
+/// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClassifierConfig {
     /// Class names, in the order of the head's output columns.
@@ -65,6 +92,21 @@ impl ClassifierConfig {
     /// a mean over chunks says "the document as a whole is about this", which is
     /// not what a multi-label question asks. Call [`Self::with_reducer`] afterwards
     /// to override.
+    ///
+    /// ```
+    /// use burn_setfit::{ClassifierConfig, Reducer};
+    ///
+    /// let single = ClassifierConfig::new(["a", "b"]);
+    /// assert_eq!(single.reducer, Reducer::MeanLogits);
+    ///
+    /// // Switching the task moves the reducer with it...
+    /// let multi = single.multi_label();
+    /// assert_eq!(multi.reducer, Reducer::MaxLogits);
+    ///
+    /// // ...unless you pin one afterwards.
+    /// let pinned = multi.with_reducer(Reducer::TopKMeanLogits { k: 3 });
+    /// assert_eq!(pinned.reducer, Reducer::TopKMeanLogits { k: 3 });
+    /// ```
     pub fn with_task(mut self, task: TaskMode) -> Self {
         self.task = task;
         self.reducer = Reducer::default_for(task);
@@ -95,6 +137,14 @@ impl ClassifierConfig {
     }
 
     /// The decision threshold, or `None` for single-label.
+    ///
+    /// ```
+    /// use burn_setfit::ClassifierConfig;
+    ///
+    /// // An argmax has nothing to threshold, so there is nothing to report.
+    /// assert_eq!(ClassifierConfig::new(["a", "b"]).threshold(), None);
+    /// assert_eq!(ClassifierConfig::new(["a", "b"]).multi_label().threshold(), Some(0.5));
+    /// ```
     pub fn threshold(&self) -> Option<f32> {
         match self.task {
             TaskMode::SingleLabel => None,

@@ -3,6 +3,17 @@
 use std::fmt;
 
 /// Anything that can go wrong loading, training, or running a SetFit model.
+///
+/// Every variant carries a message that names what was wrong, rather than only
+/// what kind of thing was wrong:
+///
+/// ```
+/// use burn_setfit::{Bundle, SetFitError};
+///
+/// let err = Bundle::unpack(b"not a bundle").unwrap_err();
+/// assert!(matches!(err, SetFitError::Bundle(_)));
+/// assert_eq!(err.to_string(), "bundle error: not a .setfit bundle");
+/// ```
 #[derive(Debug)]
 pub enum SetFitError {
     /// Weight (de)serialisation failed.

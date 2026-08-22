@@ -42,6 +42,19 @@ pub const FORMAT_VERSION: u32 = 1;
 /// Splits along the line of who chose what: [`Self::classifier`] is the caller's
 /// configuration, while [`Self::variant`] and [`Self::body`] describe the
 /// checkpoint it was built on and are filled in from that checkpoint.
+///
+/// ```no_run
+/// # use burn::backend::NdArray;
+/// # use burn_setfit::Classifier;
+/// # fn main() -> burn_setfit::Result<()> {
+/// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+/// let manifest = classifier.manifest();
+///
+/// println!("{:?} over {:?}", manifest.task(), manifest.labels());
+/// println!("body: {:?}, {} wide", manifest.variant, manifest.body.hidden_size);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
     /// Which MiniLM checkpoint the body came from.
@@ -129,6 +142,33 @@ fn check_against_module<B: Backend>(manifest: &Manifest, module: &SetFitModule<B
 }
 
 /// A parsed bundle, before the weights are materialised onto a device.
+///
+/// Most callers never name this type — [`crate::Classifier::from_bundle`] does
+/// the unpacking. Reach for it to inspect a model without loading it onto a
+/// device:
+///
+/// ```no_run
+/// use burn_setfit::Bundle;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let bundle = Bundle::unpack(&std::fs::read("support.setfit")?)?;
+///
+/// println!("{:?}", bundle.manifest.labels());
+/// println!("trained on {:?}", bundle.manifest.variant);
+/// println!("{} bytes of weights", bundle.weights.len());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Anything that is not a bundle, or is a truncated one, is refused rather than
+/// misread:
+///
+/// ```
+/// use burn_setfit::Bundle;
+///
+/// assert!(Bundle::unpack(b"").is_err());
+/// assert!(Bundle::unpack(b"BSETFIT\x00 but nothing after it").is_err());
+/// ```
 #[derive(Debug, Clone)]
 pub struct Bundle {
     /// Model configuration and metadata.

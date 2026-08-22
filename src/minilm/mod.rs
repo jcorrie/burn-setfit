@@ -21,6 +21,13 @@ pub use model::*;
 pub use pooling::*;
 
 /// The two published `all-MiniLM-*-v2` checkpoints.
+///
+/// ```
+/// use burn_setfit::MiniLmVariant;
+///
+/// assert_eq!(MiniLmVariant::default(), MiniLmVariant::L6);
+/// assert_eq!(MiniLmVariant::L6.model_id(), "sentence-transformers/all-MiniLM-L6-v2");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum MiniLmVariant {
     /// 6 layers, ~22.7M parameters. The sane default for wasm.

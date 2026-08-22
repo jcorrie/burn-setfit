@@ -44,8 +44,8 @@ Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
 
 ```rust
 use burn::backend::{Autodiff, NdArray};
-use burn_setfit::{Checkpoint, ClassifierConfig, minilm::MiniLmVariant};
-use burn_setfit::{infer::Classifier, train::{Example, TrainConfig, Trainer}};
+use burn_setfit::{Checkpoint, Classifier, ClassifierConfig, Example, MiniLmVariant,
+                  TrainConfig, Trainer};
 
 let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
 
@@ -76,6 +76,11 @@ let prediction = classifier.classify(very_long_document)?;
 
 `examples/train_and_classify.rs` is the same thing, complete and compiled.
 
+Everything a caller ordinarily names is re-exported at the crate root, so that
+is one `use` line rather than six. The modules stay public: accumulators, the
+chunker, the head and the vendored body are all still reachable at their own
+paths.
+
 ## Configuration
 
 [`ClassifierConfig`] is the one place behaviour is decided, and the one place it
@@ -105,14 +110,43 @@ without retraining or repacking:
 Classifier::from_bundle(&bundle, device)?.with_reducer(Reducer::TopKMeanLogits { k: 3 })
 ```
 
-Run the examples:
+## Examples
+
+| Example | What it shows | Needs |
+| ------- | ------------- | ----- |
+| `train_and_classify` | The whole path: download, fine-tune, pack, classify short and long input | network |
+| `long_document` | Four configurations over a planted signal and a filler-only control — where the measurements in [A measured limitation](#a-measured-limitation) come from | network |
+| `local_checkpoint` | The same round trip from three files on disk rather than a download, which is the entry point the browser uses | a checkpoint directory |
+| `reference` | An independent BERT forward pass from the raw safetensors, for bisecting a disagreement between Burn and the checkpoint | network |
 
 ```bash
 cargo run --release --example train_and_classify
+cargo run --release --example long_document
 ```
 
+`local_checkpoint` is the one that runs without network access. Point it at a
+HuggingFace snapshot you already have, or generate the toy checkpoint the
+browser harness uses:
+
 ```bash
-cargo run --release --example long_document
+python3 browser-test/make_toy_checkpoint.py /tmp/toy
+cargo run --release --example local_checkpoint -- /tmp/toy
+```
+
+That toy body is 32 wide over a vocabulary of single letters, so it exercises
+the pipeline and tells you nothing about the model.
+
+## API documentation
+
+```bash
+cargo doc --open --features ndarray,train,native
+```
+
+35 examples in the docs, all compiled as tests on every run — the ones that
+need no weights actually execute:
+
+```bash
+cargo test --doc --features ndarray,train,native
 ```
 
 ## Tests

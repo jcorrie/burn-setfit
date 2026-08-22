@@ -12,6 +12,38 @@ use crate::tokenize::Tokenizer;
 use burn::tensor::backend::Backend;
 
 /// Everything needed to start from a pretrained body.
+///
+/// Natively, the three files come from a HuggingFace download:
+///
+/// ```no_run
+/// use burn_setfit::{Checkpoint, MiniLmVariant};
+///
+/// # fn main() -> burn_setfit::Result<()> {
+/// // Cached under the platform cache directory unless one is given.
+/// let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
+/// assert_eq!(checkpoint.config.hidden_size, 384);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// In a browser they come from three `fetch` calls, and are handed over as
+/// bytes. Everything below this point sees the same type either way, which is
+/// what keeps the two paths from drifting apart:
+///
+/// ```no_run
+/// use burn_setfit::{Checkpoint, MiniLmVariant};
+///
+/// # fn main() -> burn_setfit::Result<()> {
+/// # let (config_json, weights, tokenizer_json) = ("", Vec::new(), Vec::new());
+/// let checkpoint = Checkpoint::from_files(
+///     MiniLmVariant::L6,
+///     config_json,      // config.json
+///     weights,          // model.safetensors
+///     tokenizer_json,   // tokenizer.json
+/// )?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
     /// Which checkpoint this is.
