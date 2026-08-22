@@ -27,7 +27,7 @@
 use crate::config::ClassifierConfig;
 use crate::error::{Result, SetFitError};
 use crate::head::TaskMode;
-use crate::minilm::{MiniLmConfig, MiniLmVariant};
+use crate::minilm::{MiniLmConfig, MiniLmVariant, check_sequence_budget};
 use crate::model::SetFitModule;
 use crate::tokenize::Tokenizer;
 use burn::tensor::backend::Backend;
@@ -95,6 +95,11 @@ impl Manifest {
                 self.body.hidden_size, self.body.num_attention_heads
             )));
         }
+        check_sequence_budget(
+            &self.body,
+            self.classifier.chunk.max_tokens,
+            "chunk windows",
+        )?;
         Ok(())
     }
 }

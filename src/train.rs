@@ -16,7 +16,7 @@ use crate::checkpoint::Checkpoint;
 use crate::config::ClassifierConfig;
 use crate::error::{Result, SetFitError};
 use crate::head::{SetFitHead, SetFitHeadConfig, TaskMode};
-use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant};
+use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant, check_sequence_budget};
 use crate::model::{SetFitModule, embed_body};
 use crate::tokenize::pad_batch;
 use burn::module::AutodiffModule;
@@ -245,6 +245,16 @@ impl<B: AutodiffBackend> Trainer<B> {
         checkpoint.validate()?;
         classifier.validate()?;
         config.validate()?;
+        // Both budgets, before any work: training pads to `config.max_tokens`,
+        // and the packed model will chunk to `classifier.chunk.max_tokens`.
+        // Catching the latter here rather than at `finish` saves discovering it
+        // after the training run it invalidates.
+        check_sequence_budget(&checkpoint.config, config.max_tokens, "training sequences")?;
+        check_sequence_budget(
+            &checkpoint.config,
+            classifier.chunk.max_tokens,
+            "chunk windows",
+        )?;
 
         let num_labels = classifier.num_labels();
         if examples.len() < 2 {

@@ -43,6 +43,29 @@ impl MiniLmVariant {
 /// Hidden size of both MiniLM variants, and therefore the head's input width.
 pub const EMBEDDING_DIM: usize = 384;
 
+/// Reject a sequence budget the body's position embeddings cannot cover.
+///
+/// Position ids run `0..seq_len`, so a window longer than the position table
+/// indexes past the end of it. Burn reports that as an out-of-bounds `select`
+/// deep inside the backend — a panic, not an error, and only once a document
+/// long enough to fill a window turns up. Both published MiniLM checkpoints
+/// carry 512 positions against a 256-token window, so the gap never closes in
+/// practice; a smaller body makes it reachable.
+pub fn check_sequence_budget(
+    body: &MiniLmConfig,
+    max_tokens: usize,
+    what: &str,
+) -> crate::Result<()> {
+    if max_tokens > body.max_position_embeddings {
+        return Err(crate::SetFitError::Config(format!(
+            "{what} of {max_tokens} tokens exceeds the {} position embeddings this body has; \
+             a sequence that long would index past the position table",
+            body.max_position_embeddings
+        )));
+    }
+    Ok(())
+}
+
 /// Sequence length these checkpoints were actually trained at.
 ///
 /// The position embeddings run to 512, but `sentence_bert_config.json` caps

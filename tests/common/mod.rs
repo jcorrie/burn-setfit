@@ -67,7 +67,11 @@ pub fn toy_body_config() -> burn_setfit::minilm::MiniLmConfig {
         num_hidden_layers: 2,
         intermediate_size: 64,
         vocab_size: 64,
-        max_position_embeddings: 128,
+        // Real MiniLM carries 512 against a 256-token window. Keeping that
+        // relationship matters: a toy body with fewer positions than the
+        // default chunk window is a configuration no real checkpoint has, and
+        // testing against it tests the wrong thing.
+        max_position_embeddings: 512,
         type_vocab_size: 2,
         hidden_dropout_prob: 0.0,
         layer_norm_eps: 1e-12,

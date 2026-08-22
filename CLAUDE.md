@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-133 tests, about two seconds, no network. Stay in this loop. Anything touching
+137 tests, about two seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -19,6 +19,13 @@ and a poor fit for a constrained connection.
 cargo clippy --all-targets --features ndarray,train,native   # expected: zero warnings
 cargo build --target wasm32-unknown-unknown --no-default-features --features ndarray,train
 cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
+```
+
+Before anything that touches the browser path, run the harness — it catches what
+compiling cannot:
+
+```bash
+cd browser-test && node run.mjs     # see browser-test/README.md for the setup
 ```
 
 **Both wasm targets must keep building.** That is the point of the crate, and it
@@ -49,6 +56,18 @@ test names are given so a failure is self-explaining.
   depends on the *gap* between logits; raising both can narrow it. The property
   only survives under a monotone link, i.e. multi-label sigmoids.
   Guard: `tests/infer.rs::stronger_reducers_dominate_per_label_under_multi_label`.
+
+- **Chunk windows must fit the body's position table.** Position ids run
+  `0..seq_len`, so a window longer than `max_position_embeddings` indexes past
+  the table and Burn reports it as an out-of-bounds `select` — a panic from
+  inside the backend, and only once a document long enough to fill a window
+  turns up. Both MiniLM checkpoints have 512 positions against a 256-token
+  window, so this is unreachable with a real body and immediate with a small
+  one. `check_sequence_budget` rejects it at `Trainer::new` and
+  `Manifest::validate`; `toy_body_config` carries 512 positions for the same
+  reason. Guards:
+  `tests/bundle.rs::a_manifest_whose_windows_outrun_the_position_table_is_refused`,
+  `tests/train.rs::a_sequence_budget_beyond_the_bodys_positions_is_rejected_before_training`.
 
 - **Seeded runs reproduce weights, not bytes.** Burn writes the safetensors
   `__metadata__` map in `HashMap` order. Compare tensors, never file hashes.
@@ -90,6 +109,8 @@ the published matrix.
 
 ## Open work
 
-See [issues](https://github.com/jcorrie/burn-setfit/issues). #1 (does the wasm
-actually run in a browser) and #2 (quantize the 86.5 MB bundle) are the two that
-matter; the rest are smaller or speculative.
+See [issues](https://github.com/jcorrie/burn-setfit/issues). #1 is now half
+answered — `browser-test/` proves the wasm trains and classifies in a browser,
+but only against a toy checkpoint; the real model has never been fetched into a
+page. #2 (quantize the 86.5 MB bundle) is the other one that matters; the rest
+are smaller or speculative.

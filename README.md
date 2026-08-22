@@ -4,10 +4,11 @@ SetFit few-shot text classification in Rust on [Burn](https://github.com/tracel-
 built for native and browser targets, over documents of unbounded length.
 
 Both SetFit stages build for `wasm32-unknown-unknown`, and the training loop is a
-step-wise state machine rather than a blocking `fit()` — so the design target is a
-browser that fine-tunes from a handful of labelled examples, not one that merely
-runs a model trained elsewhere. That target is not yet demonstrated: it compiles
-and links, but no browser has run it ([#1]).
+step-wise state machine rather than a blocking `fit()` — so a browser fine-tunes
+from a handful of labelled examples rather than merely running a model trained
+elsewhere. A browser now does exactly that: `browser-test/` trains, packs and
+classifies in headless Chromium on every run. What it uses is a toy checkpoint,
+so fidelity against the real `all-MiniLM-L6-v2` in a browser is still open ([#1]).
 
 ## What it does
 
@@ -24,8 +25,9 @@ verified, and what is not, matters more than a version number here:
 
 | | |
 | --- | --- |
-| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 133 offline tests. Native training and inference, on `NdArray`. |
-| **Compiles, never run** | The wasm build in an actual browser ([#1]), the `wgpu` backend ([#5]). |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 137 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). |
+| **Compiles, never run** | The `wgpu` backend ([#5]). |
+| **Runs, but not against the real model** | The browser path, which has only been driven with a 146 KB stand-in checkpoint ([#1]). |
 | **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
 
 Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
@@ -115,7 +117,7 @@ cargo run --release --example long_document
 
 ## Tests
 
-133 tests, none needing a network. What each file is for:
+137 tests, none needing a network. What each file is for:
 
 | File | Covers |
 | ---- | ------ |
@@ -213,11 +215,33 @@ It separates well and calibrates badly.
 cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
 ```
 
-**This compiles and links; no browser has executed it** ([#1]). `tokenizers` uses
-rayon internally, which is why `src/tokenize.rs` avoids `encode_batch` — but that
-is a precaution taken from reading the dependency, not a measurement.
+**A browser runs this.** `browser-test/` drives the built artifact in headless
+Chromium: it fetches a checkpoint, fine-tunes 12 examples over 26 steps, packs a
+bundle, loads it back and classifies a document that windows into 5 chunks. The
+run asserts on what it measures, so it fails rather than reports:
 
-Training yields between steps, so a browser should stay responsive:
+| | |
+| --- | --- |
+| wasm instantiate | 188 ms |
+| `new Trainer(...)` | 55 ms — tokenizes every example and seeds the head |
+| 26 training steps | 515 ms |
+| median main-thread frame gap during training | 17 ms |
+| **worst main-thread frame gap** | **133 ms** |
+| classify a 2.7 KB document | 79 ms |
+
+The worst frame gap is the number that matters: the tab keeps painting
+throughout, which is the entire reason `Trainer` is a step-wise state machine
+rather than a `fit()` loop. The 133 ms outlier is the body-to-head transition,
+which embeds the whole training set inside one `step()`.
+
+The `tokenizers` rayon worry that shaped `src/tokenize.rs` looks unfounded on
+this evidence — the single-sequence `encode` path runs fine in a browser. That
+is not a licence to reach for `encode_batch`, which remains untested there.
+
+Still open ([#1]): every browser number above comes from a 32-wide toy
+checkpoint. Fidelity in a browser needs the real 86.5 MB model.
+
+Training yields between steps, so a browser stays responsive:
 
 ```js
 const trainer = new Trainer(configJson, weights, tokenizerJson, request);
@@ -234,7 +258,7 @@ Payload, and the part that actually matters:
 
 | Component            | Size    |
 | -------------------- | ------- |
-| `setfit_wasm.wasm`   | 8.5 MB (before `wasm-opt -Oz`, [#6]) |
+| `setfit_wasm.wasm`   | 8.0 MB (`cargo build --release`, before `wasm-opt -Oz`, [#6]) |
 | `.setfit` bundle     | 86.5 MB (MiniLM-L6, f32) |
 
 **The model dominates, not the code** — by an order of magnitude. Roughly half of
