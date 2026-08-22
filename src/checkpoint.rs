@@ -137,6 +137,7 @@ impl Checkpoint {
 
     /// Download from HuggingFace, or read from the local cache.
     #[cfg(feature = "native")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native")))]
     pub fn download(variant: MiniLmVariant, cache_dir: Option<std::path::PathBuf>) -> Result<Self> {
         use std::path::PathBuf;
 

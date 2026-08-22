@@ -124,6 +124,7 @@ impl SetFitHeadConfig {
     /// `LinearConfig` uses — keeps that guarantee without mutating global state,
     /// which a library has no business doing on someone else's behalf.
     #[cfg(feature = "train")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "train")))]
     pub fn init_seeded<B: Backend, R: rand::Rng>(
         &self,
         device: &B::Device,

@@ -113,6 +113,14 @@
 //! `native` is the only feature that cannot go to wasm, and it is confined to
 //! [`Checkpoint::download`] for that reason. Everything else — including both
 //! training stages — is byte-oriented and target-agnostic.
+//!
+//! Items that need a feature are labelled as such in the rendered docs, so an
+//! item that appears to be missing is a feature that is off rather than an API
+//! that does not exist.
+
+// docs.rs builds with `--cfg docsrs` (see Cargo.toml), which turns on the
+// feature labels. Nothing here changes for an ordinary build.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod bundle;
 pub mod checkpoint;
@@ -126,6 +134,7 @@ pub mod model;
 pub mod reduce;
 pub mod tokenize;
 #[cfg(feature = "train")]
+#[cfg_attr(docsrs, doc(cfg(feature = "train")))]
 pub mod train;
 
 // The types a caller names in ordinary use, re-exported so that using this
@@ -143,4 +152,5 @@ pub use minilm::{EMBEDDING_DIM, MiniLmVariant, TRAINED_SEQ_LEN};
 pub use reduce::Reducer;
 pub use tokenize::Tokenizer;
 #[cfg(feature = "train")]
+#[cfg_attr(docsrs, doc(cfg(feature = "train")))]
 pub use train::{Example, Progress, Stage, TrainConfig, Trainer};
