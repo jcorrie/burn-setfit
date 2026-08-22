@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>burn-setfit browser smoke test</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; max-width: 46rem; }
+  #bar { height: 6px; background: #ddd; margin: .5rem 0; }
+  #bar > div { height: 100%; width: 0; background: #333; }
+  pre { background: #f4f4f4; padding: .75rem; overflow-x: auto; }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+<h1>burn-setfit in the browser</h1>
+<!-- A CSS animation is not enough to prove responsiveness: it can run on the
+     compositor thread while the main thread is wedged. The heartbeat below is
+     driven by requestAnimationFrame on the main thread, so a stalled tab shows
+     up as a gap between frames. -->
+<p>heartbeat <span class="spin" id="spin">|</span> <span id="phase">starting</span></p>
+<div id="bar"><div></div></div>
+<pre id="log"></pre>
+<script type="module" src="./main.js"></script>

@@ -22,6 +22,22 @@ use burn::tensor::{Int, Tensor};
 /// only place it means anything: an argmax has nothing to threshold. Carrying it as
 /// a sibling field invites a single-label config with a carefully tuned threshold
 /// that silently does nothing.
+///
+/// ```
+/// use burn_setfit::TaskMode;
+/// use burn_setfit::infer::{decode, to_probabilities};
+///
+/// let logits = [2.0, 1.0, -3.0];
+///
+/// // Single-label: a softmax over the label set, decoded by argmax. Exactly
+/// // one label, always -- even when nothing fits.
+/// assert_eq!(decode(&to_probabilities(&logits, TaskMode::SingleLabel), TaskMode::SingleLabel), vec![0]);
+///
+/// // Multi-label: independent sigmoids, decoded by threshold. Both of these
+/// // logits are positive, so both clear 0.5.
+/// let multi = TaskMode::multi_label();
+/// assert_eq!(decode(&to_probabilities(&logits, multi), multi), vec![0, 1]);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TaskMode {
     /// Exactly one label per document. Softmax over classes, argmax to decode.
@@ -50,6 +66,15 @@ impl TaskMode {
     /// A threshold of 0 labels every document with every class; one above 1 labels
     /// nothing, whatever the model learned. Both are configuration mistakes that
     /// look like model failures.
+    ///
+    /// ```
+    /// use burn_setfit::TaskMode;
+    ///
+    /// assert!(TaskMode::MultiLabel { threshold: 0.5 }.validate().is_ok());
+    /// assert!(TaskMode::MultiLabel { threshold: 0.0 }.validate().is_err());
+    /// assert!(TaskMode::MultiLabel { threshold: 1.0 }.validate().is_err());
+    /// assert!(TaskMode::MultiLabel { threshold: f32::NAN }.validate().is_err());
+    /// ```
     pub fn validate(&self) -> crate::Result<()> {
         match self {
             TaskMode::SingleLabel => Ok(()),
@@ -99,6 +124,7 @@ impl SetFitHeadConfig {
     /// `LinearConfig` uses — keeps that guarantee without mutating global state,
     /// which a library has no business doing on someone else's behalf.
     #[cfg(feature = "train")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "train")))]
     pub fn init_seeded<B: Backend, R: rand::Rng>(
         &self,
         device: &B::Device,

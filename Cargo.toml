@@ -5,8 +5,26 @@ members = [".", "crates/setfit-wasm"]
 name = "burn-setfit"
 version = "0.1.0"
 edition = "2024"
+# Measured, not inferred: 1.91 is refused outright because burn 0.21 and
+# cubecl-zspace declare 1.92, and the whole suite passes on 1.92. Our own code
+# needs less than that — edition 2024 wants 1.85, the let-chains in `config.rs`
+# want 1.88 — so this floor moves with Burn rather than with us.
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 description = "SetFit few-shot text classification in Rust with Burn, targeting native and wasm"
+repository = "https://github.com/jcorrie/burn-setfit"
+readme = "README.md"
+keywords = ["setfit", "few-shot", "classification", "burn", "wasm"]
+categories = ["science", "text-processing", "wasm"]
+# The browser harness is a test rig, not part of the published crate; the toy
+# checkpoint it needs is generated, not committed.
+exclude = ["/browser-test"]
+
+# Document every feature, and mark the feature-gated items as such, so `train`
+# and `native` items are not silently missing from the rendered docs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["ndarray", "train", "native"]

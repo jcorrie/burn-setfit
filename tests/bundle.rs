@@ -7,7 +7,7 @@ use burn_setfit::bundle::{Bundle, FORMAT_VERSION, Manifest};
 use burn_setfit::chunk::ChunkConfig;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::infer::Classifier;
-use burn_setfit::minilm::MiniLmVariant;
+use burn_setfit::minilm::{MiniLmConfig, MiniLmVariant};
 use burn_setfit::model::SetFitModule;
 use burn_setfit::reduce::Reducer;
 use common::{small_chunking, toy_body_config, toy_bundle, toy_checkpoint, toy_tokenizer_json};
@@ -133,6 +133,48 @@ fn a_bundle_carrying_an_invalid_config_is_refused_on_load() {
     // Either the JSON no longer parses or validation catches the duplicate;
     // both are correct, and neither is a silently mislabelled model.
     assert!(Bundle::unpack(&tampered).is_err());
+}
+
+#[test]
+fn a_manifest_whose_windows_outrun_the_position_table_is_refused() {
+    // Position ids run 0..seq_len, so a window longer than the position table
+    // indexes past the end of it — which surfaces as an out-of-bounds panic
+    // inside the backend, and only once a document long enough to fill a window
+    // arrives. Both published MiniLM checkpoints have 512 positions against a
+    // 256-token window, so this is only reachable on a smaller body.
+    let small_body = MiniLmConfig {
+        max_position_embeddings: 64,
+        ..toy_body_config()
+    };
+    let manifest = Manifest::new(
+        MiniLmVariant::L6,
+        small_body,
+        ClassifierConfig::new(["alpha", "beta"]).with_chunking(ChunkConfig::new(128)),
+    );
+
+    let err = manifest
+        .validate()
+        .expect_err("windows the body cannot encode must be refused");
+    let message = format!("{err}");
+    assert!(
+        message.contains("128") && message.contains("64"),
+        "the message should name both budgets, got: {message}"
+    );
+}
+
+#[test]
+fn a_window_the_body_can_just_encode_is_accepted() {
+    // The boundary is inclusive: a window exactly as long as the position table
+    // uses positions 0..max, which is precisely what the table holds.
+    let manifest = Manifest::new(
+        MiniLmVariant::L6,
+        MiniLmConfig {
+            max_position_embeddings: 64,
+            ..toy_body_config()
+        },
+        ClassifierConfig::new(["alpha", "beta"]).with_chunking(ChunkConfig::new(64)),
+    );
+    manifest.validate().expect("a window that fits is fine");
 }
 
 // ── manifest and weights must agree ─────────────────────────────────────────

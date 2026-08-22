@@ -19,6 +19,29 @@
 use crate::head::TaskMode;
 
 /// How per-chunk logits collapse into one document-level score vector.
+///
+/// Every variant is an online fold, so a document of any length reduces in
+/// bounded memory. The choice matters most when one passage in many carries the
+/// label:
+///
+/// ```
+/// use burn_setfit::Reducer;
+///
+/// // Three chunks, two labels. Only the middle chunk is about label 1.
+/// let chunks = [[2.0, -3.0], [-1.0, 4.0], [1.5, -2.5]];
+///
+/// let mut mean = Reducer::MeanLogits.accumulator(2);
+/// let mut max = Reducer::MaxLogits.accumulator(2);
+/// for chunk in &chunks {
+///     // The weight is the chunk's token count; only the mean consults it.
+///     mean.push(100.0, chunk);
+///     max.push(100.0, chunk);
+/// }
+///
+/// // The mean washes the one relevant passage away; the max keeps it.
+/// assert!(mean.finish()[1] < 0.0);
+/// assert_eq!(max.finish()[1], 4.0);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Reducer {
     /// Token-count-weighted mean of logits. Equivalent to mean-pooling the chunk
@@ -60,6 +83,16 @@ pub enum Reducer {
 
 impl Reducer {
     /// The reducer that suits a task mode when the caller has no opinion.
+    ///
+    /// ```
+    /// use burn_setfit::{Reducer, TaskMode};
+    ///
+    /// // "The label describes the whole document" -- every chunk votes.
+    /// assert_eq!(Reducer::default_for(TaskMode::SingleLabel), Reducer::MeanLogits);
+    /// // "The label describes something the document contains" -- one chunk can
+    /// // carry it alone. Not NoisyOr: that saturates once a document is long.
+    /// assert_eq!(Reducer::default_for(TaskMode::multi_label()), Reducer::MaxLogits);
+    /// ```
     pub fn default_for(task: TaskMode) -> Self {
         match task {
             // The label describes the whole document, so every chunk votes.
@@ -76,6 +109,15 @@ impl Reducer {
     ///
     /// Both cases were previously clamped at the point of use, which turned a
     /// configuration mistake into a model that quietly did something else.
+    ///
+    /// ```
+    /// use burn_setfit::Reducer;
+    ///
+    /// assert!(Reducer::TopKMeanLogits { k: 3 }.validate().is_ok());
+    /// // k = 0 would average no chunks at all.
+    /// assert!(Reducer::TopKMeanLogits { k: 0 }.validate().is_err());
+    /// assert!(Reducer::LogSumExp { temperature: 0.0 }.validate().is_err());
+    /// ```
     pub fn validate(&self) -> crate::Result<()> {
         match self {
             Reducer::TopKMeanLogits { k } if *k == 0 => Err(crate::SetFitError::Config(
@@ -111,6 +153,23 @@ fn softplus(x: f32) -> f32 {
 ///
 /// Memory is `O(num_labels)`, or `O(k · num_labels)` for
 /// [`Reducer::TopKMeanLogits`] — bounded either way, regardless of document size.
+///
+/// ```
+/// use burn_setfit::Reducer;
+///
+/// let mut acc = Reducer::MeanLogits.accumulator(2);
+/// assert_eq!(acc.count(), 0);
+/// // An empty document reduces to zeros -- check `count`, do not read meaning
+/// // into the scores.
+/// assert_eq!(acc.finish(), vec![0.0, 0.0]);
+///
+/// // The mean is weighted by token count, so a half-full trailing chunk does
+/// // not vote as loudly as a full one.
+/// acc.push(300.0, &[1.0, 0.0]);
+/// acc.push(100.0, &[-1.0, 0.0]);
+/// assert_eq!(acc.count(), 2);
+/// assert_eq!(acc.finish()[0], 0.5);
+/// ```
 #[derive(Debug, Clone)]
 pub struct Accumulator {
     reducer: Reducer,

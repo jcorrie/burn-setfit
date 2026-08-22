@@ -4,10 +4,11 @@ SetFit few-shot text classification in Rust on [Burn](https://github.com/tracel-
 built for native and browser targets, over documents of unbounded length.
 
 Both SetFit stages build for `wasm32-unknown-unknown`, and the training loop is a
-step-wise state machine rather than a blocking `fit()` — so the design target is a
-browser that fine-tunes from a handful of labelled examples, not one that merely
-runs a model trained elsewhere. That target is not yet demonstrated: it compiles
-and links, but no browser has run it ([#1]).
+step-wise state machine rather than a blocking `fit()` — so a browser fine-tunes
+from a handful of labelled examples rather than merely running a model trained
+elsewhere. A browser now does exactly that: `browser-test/` trains, packs and
+classifies in headless Chromium on every run. What it uses is a toy checkpoint,
+so fidelity against the real `all-MiniLM-L6-v2` in a browser is still open ([#1]).
 
 ## What it does
 
@@ -24,8 +25,9 @@ verified, and what is not, matters more than a version number here:
 
 | | |
 | --- | --- |
-| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 133 offline tests. Native training and inference, on `NdArray`. |
-| **Compiles, never run** | The wasm build in an actual browser ([#1]), the `wgpu` backend ([#5]). |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 142 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). |
+| **Compiles, never run** | The `wgpu` backend ([#5]). |
+| **Runs, but not against the real model** | The browser path, which has only been driven with a 146 KB stand-in checkpoint ([#1]). |
 | **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
 
 Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
@@ -42,8 +44,8 @@ Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
 
 ```rust
 use burn::backend::{Autodiff, NdArray};
-use burn_setfit::{Checkpoint, ClassifierConfig, minilm::MiniLmVariant};
-use burn_setfit::{infer::Classifier, train::{Example, TrainConfig, Trainer}};
+use burn_setfit::{Checkpoint, Classifier, ClassifierConfig, Example, MiniLmVariant,
+                  TrainConfig, Trainer};
 
 let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
 
@@ -74,6 +76,11 @@ let prediction = classifier.classify(very_long_document)?;
 
 `examples/train_and_classify.rs` is the same thing, complete and compiled.
 
+Everything a caller ordinarily names is re-exported at the crate root, so that
+is one `use` line rather than six. The modules stay public: accumulators, the
+chunker, the head and the vendored body are all still reachable at their own
+paths.
+
 ## Configuration
 
 [`ClassifierConfig`] is the one place behaviour is decided, and the one place it
@@ -103,19 +110,68 @@ without retraining or repacking:
 Classifier::from_bundle(&bundle, device)?.with_reducer(Reducer::TopKMeanLogits { k: 3 })
 ```
 
-Run the examples:
+## Errors
+
+One type, [`SetFitError`], across the whole crate, and `?` composes with
+`std::io` so reading a bundle off disk and parsing it need one error type rather
+than a `Box<dyn Error>`:
+
+```rust
+fn load(path: &str) -> burn_setfit::Result<Classifier<NdArray<f32>>> {
+    let bytes = std::fs::read(path)?;                    // io::Error
+    Classifier::from_bundle(&bytes, Default::default())  // SetFitError
+}
+```
+
+The underlying `io::Error` is kept rather than flattened into a string, so
+`ErrorKind` and `source()` both still work. The other variants are built from
+foreign errors — `burn_store`, `tokenizers`, `hf_hub` — and fold those messages
+into their own, because naming which file or which example failed is worth more
+than the chain. The enum is `#[non_exhaustive]`, so gaining a variant is not a
+breaking change.
+
+## Examples
+
+| Example | What it shows | Needs |
+| ------- | ------------- | ----- |
+| `train_and_classify` | The whole path: download, fine-tune, pack, classify short and long input | network |
+| `long_document` | Four configurations over a planted signal and a filler-only control — where the measurements in [A measured limitation](#a-measured-limitation) come from | network |
+| `local_checkpoint` | The same round trip from three files on disk rather than a download, which is the entry point the browser uses | a checkpoint directory |
+| `reference` | An independent BERT forward pass from the raw safetensors, for bisecting a disagreement between Burn and the checkpoint | network |
 
 ```bash
 cargo run --release --example train_and_classify
+cargo run --release --example long_document
 ```
 
+`local_checkpoint` is the one that runs without network access. Point it at a
+HuggingFace snapshot you already have, or generate the toy checkpoint the
+browser harness uses:
+
 ```bash
-cargo run --release --example long_document
+python3 browser-test/make_toy_checkpoint.py /tmp/toy
+cargo run --release --example local_checkpoint -- /tmp/toy
+```
+
+That toy body is 32 wide over a vocabulary of single letters, so it exercises
+the pipeline and tells you nothing about the model.
+
+## API documentation
+
+```bash
+cargo doc --open --features ndarray,train,native
+```
+
+37 examples in the docs, all compiled as tests on every run — the ones that
+need no weights actually execute:
+
+```bash
+cargo test --doc --features ndarray,train,native
 ```
 
 ## Tests
 
-133 tests, none needing a network. What each file is for:
+142 tests, none needing a network. What each file is for:
 
 | File | Covers |
 | ---- | ------ |
@@ -125,6 +181,7 @@ cargo run --release --example long_document
 | `tests/reduce.rs` | Each online fold against the plain definition it implements |
 | `tests/infer.rs` | Decoding, evidence, and invariance to batch size |
 | `tests/train.rs` | Data validation, the training state machine, reproducibility |
+| `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
 
@@ -213,11 +270,33 @@ It separates well and calibrates badly.
 cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
 ```
 
-**This compiles and links; no browser has executed it** ([#1]). `tokenizers` uses
-rayon internally, which is why `src/tokenize.rs` avoids `encode_batch` — but that
-is a precaution taken from reading the dependency, not a measurement.
+**A browser runs this.** `browser-test/` drives the built artifact in headless
+Chromium: it fetches a checkpoint, fine-tunes 12 examples over 26 steps, packs a
+bundle, loads it back and classifies a document that windows into 5 chunks. The
+run asserts on what it measures, so it fails rather than reports:
 
-Training yields between steps, so a browser should stay responsive:
+| | |
+| --- | --- |
+| wasm instantiate | 188 ms |
+| `new Trainer(...)` | 55 ms — tokenizes every example and seeds the head |
+| 26 training steps | 515 ms |
+| median main-thread frame gap during training | 17 ms |
+| **worst main-thread frame gap** | **133 ms** |
+| classify a 2.7 KB document | 79 ms |
+
+The worst frame gap is the number that matters: the tab keeps painting
+throughout, which is the entire reason `Trainer` is a step-wise state machine
+rather than a `fit()` loop. The 133 ms outlier is the body-to-head transition,
+which embeds the whole training set inside one `step()`.
+
+The `tokenizers` rayon worry that shaped `src/tokenize.rs` looks unfounded on
+this evidence — the single-sequence `encode` path runs fine in a browser. That
+is not a licence to reach for `encode_batch`, which remains untested there.
+
+Still open ([#1]): every browser number above comes from a 32-wide toy
+checkpoint. Fidelity in a browser needs the real 86.5 MB model.
+
+Training yields between steps, so a browser stays responsive:
 
 ```js
 const trainer = new Trainer(configJson, weights, tokenizerJson, request);
@@ -234,7 +313,7 @@ Payload, and the part that actually matters:
 
 | Component            | Size    |
 | -------------------- | ------- |
-| `setfit_wasm.wasm`   | 8.5 MB (before `wasm-opt -Oz`, [#6]) |
+| `setfit_wasm.wasm`   | 8.0 MB (`cargo build --release`, before `wasm-opt -Oz`, [#6]) |
 | `.setfit` bundle     | 86.5 MB (MiniLM-L6, f32) |
 
 **The model dominates, not the code** — by an order of magnitude. Roughly half of

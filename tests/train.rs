@@ -4,6 +4,7 @@ mod common;
 
 use burn::backend::{Autodiff, NdArray};
 use burn_setfit::bundle::Bundle;
+use burn_setfit::chunk::ChunkConfig;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::infer::Classifier;
 use burn_setfit::train::Stage;
@@ -323,6 +324,52 @@ fn invalid_hyperparameters_are_rejected_before_training() {
     .err()
     .expect("zero head epochs trains no head");
     assert!(format!("{err}").contains("head_epochs"));
+}
+
+#[test]
+fn a_sequence_budget_beyond_the_bodys_positions_is_rejected_before_training() {
+    // Padding a training batch to more tokens than the body has positions
+    // indexes past the position table, which the backend reports as a panic
+    // rather than an error — and only once a long enough example turns up.
+    let checkpoint = toy_checkpoint();
+    let positions = checkpoint.config.max_position_embeddings;
+
+    let err = Trainer::<AB>::new(
+        &checkpoint,
+        single_label_config(),
+        shared_separable(),
+        TrainConfig {
+            max_tokens: positions + 1,
+            ..fast_config()
+        },
+        Default::default(),
+    )
+    .err()
+    .expect("a training budget the body cannot encode must be refused");
+    assert!(
+        format!("{err}").contains(&positions.to_string()),
+        "the message should name the body's budget, got: {err}"
+    );
+}
+
+#[test]
+fn chunk_windows_beyond_the_bodys_positions_are_rejected_before_training() {
+    // The same mistake, one config away: training would succeed and only the
+    // packed model would be unusable, so it is caught before the run rather
+    // than at finish() — after the work it invalidates.
+    let checkpoint = toy_checkpoint();
+    let positions = checkpoint.config.max_position_embeddings;
+
+    let err = Trainer::<AB>::new(
+        &checkpoint,
+        ClassifierConfig::new(["a", "b"]).with_chunking(ChunkConfig::new(positions + 1)),
+        shared_separable(),
+        fast_config(),
+        Default::default(),
+    )
+    .err()
+    .expect("windows the body cannot encode must be refused");
+    assert!(format!("{err}").contains("chunk windows"), "got: {err}");
 }
 
 #[test]

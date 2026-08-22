@@ -1,1 +1,7 @@
 /target
+
+# Browser harness build products: the wasm-bindgen output and the generated
+# toy checkpoint are both reproducible from `browser-test/README.md`.
+/browser-test/node_modules
+/browser-test/public/pkg
+/browser-test/public/checkpoint

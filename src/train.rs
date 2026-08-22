@@ -16,7 +16,7 @@ use crate::checkpoint::Checkpoint;
 use crate::config::ClassifierConfig;
 use crate::error::{Result, SetFitError};
 use crate::head::{SetFitHead, SetFitHeadConfig, TaskMode};
-use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant};
+use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant, check_sequence_budget};
 use crate::model::{SetFitModule, embed_body};
 use crate::tokenize::pad_batch;
 use burn::module::AutodiffModule;
@@ -31,6 +31,20 @@ use rand::rngs::StdRng;
 ///
 /// A single-label example carries exactly one index; a multi-label example carries
 /// any number, including none.
+///
+/// ```
+/// use burn_setfit::Example;
+///
+/// // Indices point into `ClassifierConfig::labels`, in order.
+/// let single = Example::single("I was charged twice this month.", 0);
+/// assert_eq!(single.labels, vec![0]);
+///
+/// // Multi-label examples may carry several labels, or none at all -- which is
+/// // how a background or "none of the above" example is expressed.
+/// let both = Example::multi("Billing is broken and the site is down.", vec![0, 1]);
+/// let neither = Example::multi("The quarterly review ran to time.", vec![]);
+/// assert_eq!(neither.labels, Vec::<usize>::new());
+/// ```
 #[derive(Debug, Clone)]
 pub struct Example {
     /// The text.
@@ -70,6 +84,22 @@ impl Example {
 ///
 /// Defaults follow upstream SetFit, which are tuned for tens of examples per
 /// class rather than thousands.
+///
+/// ```
+/// use burn_setfit::TrainConfig;
+///
+/// let config = TrainConfig {
+///     num_iterations: 10,   // pairs generated per example, SetFit's `R`
+///     head_epochs: 40,
+///     seed: 7,              // covers pair sampling, shuffling and head init
+///     ..Default::default()
+/// };
+/// config.validate()?;
+///
+/// // Hyperparameters that would train nothing are refused, not adjusted.
+/// assert!(TrainConfig { head_epochs: 0, ..Default::default() }.validate().is_err());
+/// # Ok::<(), burn_setfit::SetFitError>(())
+/// ```
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct TrainConfig {
     /// Positive/negative pairs generated per example. SetFit calls this `R`.
@@ -166,6 +196,23 @@ pub enum Stage {
 }
 
 /// What one step accomplished.
+///
+/// ```no_run
+/// # use burn::backend::{Autodiff, NdArray};
+/// # use burn_setfit::{Stage, Trainer};
+/// # fn drive(trainer: &mut Trainer<Autodiff<NdArray<f32>>>) -> burn_setfit::Result<()> {
+/// while let Some(p) = trainer.step()? {
+///     // `total_steps` is known before training starts, so a progress bar needs
+///     // no guesswork.
+///     eprintln!("{:?} {}/{} loss {:.4} ({:.0}%)",
+///               p.stage, p.step, p.total_steps, p.loss, p.fraction() * 100.0);
+///     if p.stage == Stage::Head {
+///         // The body is frozen from here; only the classifier is still moving.
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Progress {
     /// The stage this step belonged to.
@@ -190,6 +237,50 @@ impl Progress {
 }
 
 /// Drives both SetFit stages, one optimiser step at a time.
+///
+/// Natively, run it to completion:
+///
+/// ```no_run
+/// use burn::backend::{Autodiff, NdArray};
+/// use burn_setfit::{Checkpoint, ClassifierConfig, Example, MiniLmVariant, TrainConfig, Trainer};
+///
+/// # fn main() -> burn_setfit::Result<()> {
+/// let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
+///
+/// let mut trainer = Trainer::<Autodiff<NdArray<f32>>>::new(
+///     &checkpoint,
+///     ClassifierConfig::new(["billing", "outage"]),
+///     vec![
+///         Example::single("I was charged twice this month.", 0),
+///         Example::single("The dashboard is returning 503s.", 1),
+///         // ...eight or so per class
+///     ],
+///     TrainConfig::default(),
+///     Default::default(),
+/// )?;
+///
+/// trainer.fit_with(|p| eprintln!("{:?} {}/{}", p.stage, p.step, p.total_steps))?;
+/// let bundle: Vec<u8> = trainer.finish()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// In a browser, drive [`Trainer::step`] yourself and yield between calls. That
+/// is what this being a state machine rather than a `fit()` loop buys: a minute
+/// of fine-tuning does not become a minute of frozen tab.
+///
+/// ```no_run
+/// # use burn::backend::{Autodiff, NdArray};
+/// # use burn_setfit::Trainer;
+/// # fn drive(trainer: &mut Trainer<Autodiff<NdArray<f32>>>) -> burn_setfit::Result<()> {
+/// while let Some(progress) = trainer.step()? {
+///     render(progress.fraction());
+///     // ...and in wasm, await a frame here before the next step.
+/// }
+/// # Ok(())
+/// # }
+/// # fn render(_: f32) {}
+/// ```
 pub struct Trainer<B: AutodiffBackend> {
     body: MiniLmModel<B>,
     head: SetFitHead<B>,
@@ -245,6 +336,16 @@ impl<B: AutodiffBackend> Trainer<B> {
         checkpoint.validate()?;
         classifier.validate()?;
         config.validate()?;
+        // Both budgets, before any work: training pads to `config.max_tokens`,
+        // and the packed model will chunk to `classifier.chunk.max_tokens`.
+        // Catching the latter here rather than at `finish` saves discovering it
+        // after the training run it invalidates.
+        check_sequence_budget(&checkpoint.config, config.max_tokens, "training sequences")?;
+        check_sequence_budget(
+            &checkpoint.config,
+            classifier.chunk.max_tokens,
+            "chunk windows",
+        )?;
 
         let num_labels = classifier.num_labels();
         if examples.len() < 2 {
@@ -526,6 +627,11 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// well-formed bundle containing a head that had never been fitted — a model
     /// that loads cleanly and predicts noise, which is far harder to diagnose than
     /// an error here.
+    ///
+    /// The bundle is everything needed to classify — weights, tokenizer and
+    /// configuration — so it is one file to ship and one `fetch` to load. Use
+    /// [`Self::into_model`] instead to inspect a partially trained model
+    /// deliberately.
     pub fn finish(self) -> Result<Vec<u8>> {
         if self.stage != Stage::Done {
             return Err(SetFitError::Training(format!(

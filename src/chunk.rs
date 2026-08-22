@@ -26,6 +26,28 @@ use core::ops::Range;
 const MAX_SEGMENT_BYTES: usize = 8 * 1024;
 
 /// How documents are windowed.
+///
+/// ```
+/// use burn_setfit::ChunkConfig;
+///
+/// let chunking = ChunkConfig::new(256).with_overlap(32).with_min_final_tokens(16);
+///
+/// // Two of the 256 tokens are spent on [CLS] and [SEP].
+/// assert_eq!(chunking.capacity(), 254);
+/// chunking.validate()?;
+/// # Ok::<(), burn_setfit::SetFitError>(())
+/// ```
+///
+/// Windowing that could not make progress is refused rather than adjusted:
+///
+/// ```
+/// use burn_setfit::ChunkConfig;
+///
+/// // Carrying forward as much as a window holds means each window re-reads
+/// // what the last one did, and the document never advances.
+/// let err = ChunkConfig::new(32).with_overlap(30).validate().unwrap_err();
+/// assert!(format!("{err}").contains("never advance"));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChunkConfig {
     /// Maximum sequence length including `[CLS]` and `[SEP]`.
@@ -433,6 +455,23 @@ impl<I: Iterator<Item = String>> Iterator for Chunker<'_, I> {
 }
 
 /// Chunk a single in-memory string.
+///
+/// ```no_run
+/// use burn_setfit::{ChunkConfig, Tokenizer};
+/// use burn_setfit::chunk::chunk_str;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let tokenizer = Tokenizer::from_bytes(&[])?;
+/// # let document = "";
+/// for chunk in chunk_str(document, &tokenizer, ChunkConfig::default()) {
+///     let chunk = chunk?;
+///     // Each chunk knows where it came from, which is what lets a label be
+///     // traced back to the passage that caused it.
+///     println!("{} tokens from bytes {:?}", chunk.token_count, chunk.byte_range);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn chunk_str<'a>(
     text: &str,
     tokenizer: &'a Tokenizer,

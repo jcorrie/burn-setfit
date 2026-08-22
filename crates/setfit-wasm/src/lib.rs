@@ -13,11 +13,10 @@
 //! thing to call from the main thread.
 
 use burn::backend::{Autodiff, NdArray};
-use burn_setfit::checkpoint::Checkpoint;
-use burn_setfit::config::ClassifierConfig;
-use burn_setfit::infer::Classifier as CoreClassifier;
-use burn_setfit::minilm::MiniLmVariant;
-use burn_setfit::train::{Example, TrainConfig, Trainer as CoreTrainer};
+use burn_setfit::{
+    Checkpoint, Classifier as CoreClassifier, ClassifierConfig, Example, MiniLmVariant,
+    TrainConfig, Trainer as CoreTrainer,
+};
 use wasm_bindgen::prelude::*;
 
 type B = NdArray<f32>;

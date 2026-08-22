@@ -36,6 +36,29 @@ pub struct Evidence {
 }
 
 /// The outcome of classifying one document.
+///
+/// ```no_run
+/// use burn::backend::NdArray;
+/// use burn_setfit::Classifier;
+///
+/// # fn main() -> burn_setfit::Result<()> {
+/// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+/// # let document = "";
+/// let prediction = classifier.classify(document)?;
+///
+/// // `predicted` is one index for single-label, zero or more for multi-label.
+/// for name in prediction.labels(classifier.manifest()) {
+///     println!("{name}");
+/// }
+///
+/// // Every predicted label can be traced back to the passage that caused it.
+/// for evidence in &prediction.evidence {
+///     let passage = &document[evidence.byte_range.clone()];
+///     println!("{:.3}  {passage}", evidence.score);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Prediction {
     /// Probability per label, in manifest label order.
@@ -71,6 +94,37 @@ impl Prediction {
 }
 
 /// A loaded SetFit model, ready to classify.
+///
+/// ```no_run
+/// use burn::backend::NdArray;
+/// use burn_setfit::{Classifier, Reducer};
+///
+/// # fn main() -> burn_setfit::Result<()> {
+/// // `?` composes: the file read and the unpack share one error type.
+/// let bundle = std::fs::read("support.setfit")?;
+/// let classifier = Classifier::<NdArray<f32>>::from_bundle(&bundle, Default::default())?;
+///
+/// let prediction = classifier.classify("I was charged twice this month.")?;
+/// println!("{:?} from {} chunks", prediction.labels(classifier.manifest()), prediction.chunks_seen);
+///
+/// // Reduction, hierarchy and threshold are decode-time choices, so sweeping
+/// // them needs no retraining and no repacking.
+/// let strict = classifier
+///     .with_reducer(Reducer::TopKMeanLogits { k: 3 })
+///     .with_hierarchy(8);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The bundle carries its own error handling: reading a file that is not one is
+/// refused rather than misinterpreted.
+///
+/// ```
+/// use burn::backend::NdArray;
+/// use burn_setfit::Classifier;
+///
+/// assert!(Classifier::<NdArray<f32>>::from_bundle(b"not a bundle", Default::default()).is_err());
+/// ```
 pub struct Classifier<B: Backend> {
     module: SetFitModule<B>,
     tokenizer: Tokenizer,
@@ -196,6 +250,23 @@ impl<B: Backend> Classifier<B> {
     /// The source is consumed lazily and may be arbitrarily long: chunks are
     /// encoded and folded as they are produced, and only the current batch is
     /// ever resident.
+    ///
+    /// ```no_run
+    /// use burn::backend::NdArray;
+    /// use burn_setfit::Classifier;
+    /// use std::io::{BufRead, BufReader};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+    /// // A file of any size, never held in memory as a whole.
+    /// let file = BufReader::new(std::fs::File::open("transcript.txt")?);
+    /// let lines = file.lines().map_while(std::result::Result::ok).map(|l| l + "\n");
+    ///
+    /// let prediction = classifier.classify_stream(lines)?;
+    /// println!("{} chunks", prediction.chunks_seen);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn classify_stream<I: Iterator<Item = String>>(&self, source: I) -> Result<Prediction> {
         let num_labels = self.cfg().num_labels();
         let mut accumulator =
@@ -302,6 +373,20 @@ impl<B: Backend> Classifier<B> {
     ///
     /// Inputs longer than the configured window are truncated, matching what
     /// `sentence-transformers` does. Long documents belong in [`Self::classify`].
+    ///
+    /// ```no_run
+    /// # use burn::backend::NdArray;
+    /// # use burn_setfit::Classifier;
+    /// # fn main() -> burn_setfit::Result<()> {
+    /// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+    /// let vectors = classifier.embed(&["The weather is lovely today.", "It's so sunny outside!"])?;
+    ///
+    /// // L2-normalised, so cosine similarity is a dot product.
+    /// let similarity: f32 = vectors[0].iter().zip(&vectors[1]).map(|(a, b)| a * b).sum();
+    /// println!("{similarity:.4}");
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         // An empty batch would reach the encoder as a zero-row tensor and panic
         // inside the backend rather than returning nothing.
@@ -331,6 +416,21 @@ impl<B: Backend> Classifier<B> {
 }
 
 /// Logits to probabilities, in the space the task mode implies.
+///
+/// ```
+/// use burn_setfit::TaskMode;
+/// use burn_setfit::infer::to_probabilities;
+///
+/// // Single-label scores are a softmax, so they sum to one: raising every
+/// // logit changes nothing, only the gaps between them matter.
+/// let softmax = to_probabilities(&[2.0, 1.0, 0.0], TaskMode::SingleLabel);
+/// assert!((softmax.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+///
+/// // Multi-label scores are independent sigmoids, so they need not.
+/// let sigmoids = to_probabilities(&[2.0, 1.0, 0.0], TaskMode::multi_label());
+/// assert!(sigmoids.iter().sum::<f32>() > 1.0);
+/// assert_eq!(sigmoids[2], 0.5);
+/// ```
 pub fn to_probabilities(logits: &[f32], task: TaskMode) -> Vec<f32> {
     match task {
         TaskMode::SingleLabel => {
@@ -344,6 +444,21 @@ pub fn to_probabilities(logits: &[f32], task: TaskMode) -> Vec<f32> {
 }
 
 /// Turn probabilities into predicted label indices.
+///
+/// ```
+/// use burn_setfit::TaskMode;
+/// use burn_setfit::infer::decode;
+///
+/// let scores = [0.2, 0.7, 0.6];
+///
+/// // Single-label always returns exactly one index.
+/// assert_eq!(decode(&scores, TaskMode::SingleLabel), vec![1]);
+///
+/// // Multi-label returns genuinely zero or more: a document that matches
+/// // nothing returns nothing, rather than its least-bad class.
+/// assert_eq!(decode(&scores, TaskMode::MultiLabel { threshold: 0.5 }), vec![1, 2]);
+/// assert_eq!(decode(&scores, TaskMode::MultiLabel { threshold: 0.9 }), Vec::<usize>::new());
+/// ```
 pub fn decode(scores: &[f32], task: TaskMode) -> Vec<usize> {
     match task {
         TaskMode::SingleLabel => scores
