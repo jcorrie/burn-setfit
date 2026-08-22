@@ -1,7 +1,47 @@
+[workspace]
+members = [".", "crates/setfit-wasm"]
+
 [package]
 name = "burn-setfit"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "SetFit few-shot text classification in Rust with Burn, targeting native and wasm"
+
+[features]
+default = ["ndarray", "train", "native"]
+
+# Backends
+ndarray = ["burn/ndarray"]
+wgpu    = ["burn/wgpu"]
+
+# Few-shot training (contrastive body fine-tune + head fit). Works on wasm.
+train = ["burn/autodiff", "dep:rand"]
+
+# Filesystem + HuggingFace Hub loading. NOT wasm-compatible.
+native = ["dep:hf-hub", "dep:dirs", "burn/network"]
 
 [dependencies]
-burn = { version = "0.21.0", features = ["wgpu"] }
+burn        = { version = "0.21.0", default-features = false, features = ["std"] }
+burn-store  = { version = "0.21.0", default-features = false, features = ["std", "safetensors"] }
+safetensors = "0.7"
+
+# `unstable_wasm` swaps oniguruma (C, wasm-hostile) for fancy-regex. Works natively too,
+# so we use one regex backend everywhere rather than diverging per target.
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
+
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand       = { version = "0.9", optional = true }
+hf-hub     = { version = "0.5", optional = true }
+dirs       = { version = "6", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Both majors are live in the tree; each needs its browser entropy backend enabled.
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+serde_json = "1"
+burn-store = { version = "0.21.0", default-features = false, features = ["std", "safetensors"] }
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
