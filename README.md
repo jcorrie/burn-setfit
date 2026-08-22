@@ -1,10 +1,13 @@
 # burn-setfit
 
 SetFit few-shot text classification in Rust on [Burn](https://github.com/tracel-ai/burn),
-running natively and in the browser, over documents of unbounded length.
+built for native and browser targets, over documents of unbounded length.
 
-Both SetFit stages work on `wasm32-unknown-unknown` — a browser can fine-tune from
-a handful of labelled examples, not merely run a model trained elsewhere.
+Both SetFit stages build for `wasm32-unknown-unknown`, and the training loop is a
+step-wise state machine rather than a blocking `fit()` — so the design target is a
+browser that fine-tunes from a handful of labelled examples, not one that merely
+runs a model trained elsewhere. That target is not yet demonstrated: it compiles
+and links, but no browser has run it ([#1]).
 
 ## What it does
 
@@ -16,16 +19,31 @@ a handful of labelled examples, not merely run a model trained elsewhere.
 
 ## Status
 
-Working and tested end to end. The embedding path is verified against upstream
-(below); the long-document path has a measured limitation worth reading before
-you rely on it.
+Working and tested end to end, but pre-release and unpublished. What is actually
+verified, and what is not, matters more than a version number here:
+
+| | |
+| --- | --- |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 133 offline tests. Native training and inference, on `NdArray`. |
+| **Compiles, never run** | The wasm build in an actual browser ([#1]), the `wgpu` backend ([#5]). |
+| **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
+
+Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
+[#1] and [#2] are the two that matter.
+
+[#1]: https://github.com/jcorrie/burn-setfit/issues/1
+[#2]: https://github.com/jcorrie/burn-setfit/issues/2
+[#3]: https://github.com/jcorrie/burn-setfit/issues/3
+[#4]: https://github.com/jcorrie/burn-setfit/issues/4
+[#5]: https://github.com/jcorrie/burn-setfit/issues/5
+[#6]: https://github.com/jcorrie/burn-setfit/issues/6
 
 ## Quick start
 
 ```rust
 use burn::backend::{Autodiff, NdArray};
 use burn_setfit::{Checkpoint, ClassifierConfig, minilm::MiniLmVariant};
-use burn_setfit::train::{Example, TrainConfig, Trainer};
+use burn_setfit::{infer::Classifier, train::{Example, TrainConfig, Trainer}};
 
 let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
 
@@ -46,12 +64,15 @@ trainer.fit_with(|p| eprintln!("{:?} {}/{}", p.stage, p.step, p.total_steps))?;
 let bundle: Vec<u8> = trainer.finish()?;
 ```
 
-Then classify, natively or in a browser, from those bytes alone:
+Then classify from those bytes alone — the same code path natively and in the
+browser:
 
 ```rust
 let classifier = Classifier::<NdArray<f32>>::from_bundle(&bundle, Default::default())?;
 let prediction = classifier.classify(very_long_document)?;
 ```
+
+`examples/train_and_classify.rs` is the same thing, complete and compiled.
 
 ## Configuration
 
@@ -94,11 +115,7 @@ cargo run --release --example long_document
 
 ## Tests
 
-```bash
-cargo test --features ndarray,train,native
-```
-
-133 tests. The ones worth knowing about:
+133 tests, none needing a network. What each file is for:
 
 | File | Covers |
 | ---- | ------ |
@@ -108,6 +125,7 @@ cargo test --features ndarray,train,native
 | `tests/reduce.rs` | Each online fold against the plain definition it implements |
 | `tests/infer.rs` | Decoding, evidence, and invariance to batch size |
 | `tests/train.rs` | Data validation, the training state machine, reproducibility |
+| `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
 
 ## Fidelity
@@ -183,9 +201,11 @@ hierarchically does not rescue it — saturation happens inside the first block.
 This measurement is why `Reducer::default_for(MultiLabel)` is `MaxLogits`.
 
 **If you classify long documents, use multi-label with `MaxLogits`, and train a
-background class** on text representative of your filler. That is the only
-configuration above that both separates signal from noise and correctly rejects
-the control.
+background class** ([#4] tracks making this less manual) on text representative of
+your filler. That is the only configuration above that both separates signal from
+noise and correctly rejects the control — though note it is *under-confident*: the
+signal document scores 0.389 and so predicts `other` at the default 0.5 threshold.
+It separates well and calibrates badly.
 
 ## WebAssembly
 
@@ -193,7 +213,11 @@ the control.
 cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
 ```
 
-Training yields between steps, so a browser stays responsive:
+**This compiles and links; no browser has executed it** ([#1]). `tokenizers` uses
+rayon internally, which is why `src/tokenize.rs` avoids `encode_batch` — but that
+is a precaution taken from reading the dependency, not a measurement.
+
+Training yields between steps, so a browser should stay responsive:
 
 ```js
 const trainer = new Trainer(configJson, weights, tokenizerJson, request);
@@ -203,24 +227,25 @@ do {
   render(p.fraction);
   await new Promise(requestAnimationFrame);
 } while (!p.done);
-const bundle = trainer.finish(0.5);
+const bundle = trainer.finish();
 ```
 
 Payload, and the part that actually matters:
 
 | Component            | Size    |
 | -------------------- | ------- |
-| `setfit_wasm.wasm`   | 8.5 MB (before `wasm-opt -Oz`) |
+| `setfit_wasm.wasm`   | 8.5 MB (before `wasm-opt -Oz`, [#6]) |
 | `.setfit` bundle     | 86.5 MB (MiniLM-L6, f32) |
 
-**The model dominates, not the code.** Roughly half of MiniLM-L6's 22.7M
-parameters are the 30522×384 embedding table, which quantizes well; f16 roughly
-halves the bundle and int8 roughly quarters it. Cache the bundle in the Cache API
-or IndexedDB — it is one `fetch`, by design.
+**The model dominates, not the code** — by an order of magnitude. Roughly half of
+MiniLM-L6's 22.7M parameters are the 30522×384 embedding table, which quantizes
+well; f16 should roughly halve the bundle and int8 roughly quarter it. Not yet
+implemented ([#2]). Cache the bundle in the Cache API or IndexedDB — it is one
+`fetch`, by design.
 
 ## Design notes
 
-**The MiniLM body is vendored**, not depended upon. Upstream `minilm-burn` pins
+**The MiniLM body is vendored**, not depended upon ([#3]). Upstream `minilm-burn` pins
 `tokenizers` with the `onig` feature; Cargo features are additive, so a downstream
 crate cannot switch it off, and oniguruma does not build for wasm. The vendored
 copy (`src/minilm/`, MIT OR Apache-2.0) additionally loads from bytes rather than
@@ -250,12 +275,52 @@ model class, no LBFGS to reimplement, and it trains on every Burn backend.
 
 ## Features
 
-| Feature     | Purpose                                    | wasm |
-| ----------- | ------------------------------------------ | ---- |
-| `ndarray`   | CPU backend                                | yes  |
-| `wgpu`      | GPU backend (WebGPU in browsers)           | yes  |
-| `train`     | Both training stages                       | yes  |
-| `native`    | HuggingFace download, filesystem           | no   |
+| Feature   | Purpose                            | wasm | Exercised by tests |
+| --------- | ---------------------------------- | ---- | ------------------ |
+| `ndarray` | CPU backend                        | yes  | yes                |
+| `wgpu`    | GPU backend (WebGPU in browsers)   | yes  | **no** — compiles only, see [#5] |
+| `train`   | Both training stages               | yes  | yes                |
+| `native`  | HuggingFace download, filesystem   | no   | yes (`--ignored`)  |
+
+`native` is the only feature that cannot go to wasm, and it is quarantined to one
+module for that reason — see the design notes.
+
+## Repository map
+
+| Path | What lives there |
+| ---- | ---------------- |
+| `src/config.rs` | `ClassifierConfig` — the one place behaviour is decided and validated |
+| `src/checkpoint.rs` | `Checkpoint` — config + weights + tokenizer, however they arrived |
+| `src/chunk.rs` | Streaming windower. Constant memory over unbounded input |
+| `src/reduce.rs` | Per-chunk scores to a document verdict. Read the module docs before adding one |
+| `src/train.rs` | Both SetFit stages, as a step-wise state machine |
+| `src/bundle.rs` | The `.setfit` container |
+| `src/infer.rs` | `Classifier`, decoding, evidence |
+| `src/minilm/` | Vendored MiniLM body — see [#3] before touching |
+| `crates/setfit-wasm/` | Browser bindings |
+
+## Working on this
+
+```bash
+cargo test --features ndarray,train,native      # 133 tests, ~2s, no network
+```
+
+That is the loop to stay in. The network tests and both examples download ~90 MB
+and train, so they are slow and awkward on a constrained connection:
+
+```bash
+cargo test --release --features ndarray,train,native -- --ignored   # fidelity, needs network
+cargo run --release --example train_and_classify                    # ~21s after download
+cargo run --release --example long_document                         # trains four models
+```
+
+Two things in the test harness are deliberate and easy to break:
+
+- `tests/common/mod.rs::toy_bundle` memoises **holding the lock across training**.
+  Releasing it to build and re-taking it to insert lets two threads each train a
+  differently-initialised model and compare them — the failures move between runs.
+- `toy_checkpoint` builds weights by saving a randomly-initialised body, so two
+  calls give two different models. Tests that compare must share one bundle.
 
 ## Licence
 
