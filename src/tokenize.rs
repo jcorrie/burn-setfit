@@ -25,7 +25,7 @@ pub struct SpecialTokens {
 /// ```no_run
 /// use burn_setfit::Tokenizer;
 ///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # fn main() -> burn_setfit::Result<()> {
 /// let tokenizer = Tokenizer::from_bytes(&std::fs::read("tokenizer.json")?)?;
 ///
 /// // A complete model input: [CLS] ... [SEP], truncated to the budget.

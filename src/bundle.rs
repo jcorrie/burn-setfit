@@ -150,7 +150,7 @@ fn check_against_module<B: Backend>(manifest: &Manifest, module: &SetFitModule<B
 /// ```no_run
 /// use burn_setfit::Bundle;
 ///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # fn main() -> burn_setfit::Result<()> {
 /// let bundle = Bundle::unpack(&std::fs::read("support.setfit")?)?;
 ///
 /// println!("{:?}", bundle.manifest.labels());

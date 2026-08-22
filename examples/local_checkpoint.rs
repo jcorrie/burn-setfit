@@ -35,7 +35,11 @@ type B = NdArray<f32>;
 type AB = Autodiff<B>;
 
 /// Read the three files a checkpoint is made of.
-fn load(dir: &Path) -> Result<Checkpoint, Box<dyn std::error::Error>> {
+///
+/// One error type covers both halves: `SetFitError::Io` carries a failed read,
+/// so `?` composes across the filesystem and the parse without a `Box<dyn
+/// Error>` in between.
+fn load(dir: &Path) -> burn_setfit::Result<Checkpoint> {
     let config_json = std::fs::read_to_string(dir.join("config.json"))?;
     let weights = std::fs::read(dir.join("model.safetensors"))?;
     let tokenizer_json = std::fs::read(dir.join("tokenizer.json"))?;
@@ -44,12 +48,7 @@ fn load(dir: &Path) -> Result<Checkpoint, Box<dyn std::error::Error>> {
     // layout, which is what a published checkpoint carries. Weights this crate
     // wrote itself need `Checkpoint::with_burn_naming` instead — running the
     // adapter over them would turn correct weights into wrong ones.
-    Ok(Checkpoint::from_files(
-        MiniLmVariant::L6,
-        &config_json,
-        weights,
-        tokenizer_json,
-    )?)
+    Checkpoint::from_files(MiniLmVariant::L6, &config_json, weights, tokenizer_json)
 }
 
 fn training_data() -> Vec<Example> {

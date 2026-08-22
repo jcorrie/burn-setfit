@@ -99,7 +99,8 @@ impl Prediction {
 /// use burn::backend::NdArray;
 /// use burn_setfit::{Classifier, Reducer};
 ///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # fn main() -> burn_setfit::Result<()> {
+/// // `?` composes: the file read and the unpack share one error type.
 /// let bundle = std::fs::read("support.setfit")?;
 /// let classifier = Classifier::<NdArray<f32>>::from_bundle(&bundle, Default::default())?;
 ///

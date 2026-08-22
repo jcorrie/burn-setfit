@@ -25,7 +25,7 @@ verified, and what is not, matters more than a version number here:
 
 | | |
 | --- | --- |
-| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 137 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 142 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). |
 | **Compiles, never run** | The `wgpu` backend ([#5]). |
 | **Runs, but not against the real model** | The browser path, which has only been driven with a 146 KB stand-in checkpoint ([#1]). |
 | **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
@@ -110,6 +110,26 @@ without retraining or repacking:
 Classifier::from_bundle(&bundle, device)?.with_reducer(Reducer::TopKMeanLogits { k: 3 })
 ```
 
+## Errors
+
+One type, [`SetFitError`], across the whole crate, and `?` composes with
+`std::io` so reading a bundle off disk and parsing it need one error type rather
+than a `Box<dyn Error>`:
+
+```rust
+fn load(path: &str) -> burn_setfit::Result<Classifier<NdArray<f32>>> {
+    let bytes = std::fs::read(path)?;                    // io::Error
+    Classifier::from_bundle(&bytes, Default::default())  // SetFitError
+}
+```
+
+The underlying `io::Error` is kept rather than flattened into a string, so
+`ErrorKind` and `source()` both still work. The other variants are built from
+foreign errors — `burn_store`, `tokenizers`, `hf_hub` — and fold those messages
+into their own, because naming which file or which example failed is worth more
+than the chain. The enum is `#[non_exhaustive]`, so gaining a variant is not a
+breaking change.
+
 ## Examples
 
 | Example | What it shows | Needs |
@@ -142,7 +162,7 @@ the pipeline and tells you nothing about the model.
 cargo doc --open --features ndarray,train,native
 ```
 
-35 examples in the docs, all compiled as tests on every run — the ones that
+37 examples in the docs, all compiled as tests on every run — the ones that
 need no weights actually execute:
 
 ```bash
@@ -151,7 +171,7 @@ cargo test --doc --features ndarray,train,native
 
 ## Tests
 
-137 tests, none needing a network. What each file is for:
+142 tests, none needing a network. What each file is for:
 
 | File | Covers |
 | ---- | ------ |
@@ -161,6 +181,7 @@ cargo test --doc --features ndarray,train,native
 | `tests/reduce.rs` | Each online fold against the plain definition it implements |
 | `tests/infer.rs` | Decoding, evidence, and invariance to batch size |
 | `tests/train.rs` | Data validation, the training state machine, reproducibility |
+| `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
 

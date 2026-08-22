@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-137 tests, about two seconds, no network. Stay in this loop. Anything touching
+142 tests, about two seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -83,6 +83,12 @@ test names are given so a failure is self-explaining.
   rejecting a bad value to silently clamping it — reducers used to clamp
   `k.max(1)` at point of use, which turned a config error into a model quietly
   doing something else.
+- One error type crosses the whole crate, and `?` composes with `std::io`.
+  `SetFitError::Io` keeps the underlying error rather than flattening it, so
+  `ErrorKind` still works; the variants built from foreign errors fold those
+  messages into their own, because naming the file or the example is worth more
+  than the chain. The enum is `#[non_exhaustive]` — adding a variant is not a
+  breaking change, and `Io` was added after the fact.
 - Make illegal states unrepresentable where it is cheap. The multi-label
   threshold lives *inside* `TaskMode::MultiLabel` because an argmax has nothing
   to threshold.
