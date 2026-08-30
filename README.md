@@ -26,7 +26,7 @@ verified, and what is not, matters more than a version number here:
 | | |
 | --- | --- |
 | **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 142 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). |
-| **Compiles, never run** | The `wgpu` backend ([#5]). |
+| **Compiles, never run** | The `wgpu` backend on a native target ([#5]). On `wasm32` it is now refused at compile time — see [Features](#features). |
 | **Runs, but not against the real model** | The browser path, which has only been driven with a 146 KB stand-in checkpoint ([#1]). |
 | **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
 
@@ -357,12 +357,23 @@ model class, no LBFGS to reimplement, and it trains on every Burn backend.
 | Feature   | Purpose                            | wasm | Exercised by tests |
 | --------- | ---------------------------------- | ---- | ------------------ |
 | `ndarray` | CPU backend                        | yes  | yes                |
-| `wgpu`    | GPU backend (WebGPU in browsers)   | yes  | **no** — compiles only, see [#5] |
+| `wgpu`    | GPU backend, native only           | **no** | **no** — compiles only, see [#5] |
 | `train`   | Both training stages               | yes  | yes                |
 | `native`  | HuggingFace download, filesystem   | no   | yes (`--ignored`)  |
 
-`native` is the only feature that cannot go to wasm, and it is quarantined to one
-module for that reason — see the design notes.
+`native` is filesystem and network, and is quarantined to one module for that
+reason — see the design notes.
+
+`wgpu` is a **compile error** on `wasm32`, not a runtime disappointment. WebGPU
+has no synchronous readback: a browser cannot block on a buffer map, so Burn's
+`into_data()` polls the future once, finds it pending and panics. Lazy
+`WgpuDevice` acquisition goes through the same `block_on`, so the trap actually
+arrives earlier than that — before any tensor is read, while one is being built.
+Neither is fixable above `Tensor::into_data`; both need `into_data_async` and an
+API with somewhere to await it, which this crate does not yet have. The
+combination used to compile and then die in the browser as a bare `unreachable`,
+so it is now rejected during the build. Natively `wgpu` is unaffected, because
+blocking on a future is allowed there.
 
 ## Repository map
 
