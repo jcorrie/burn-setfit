@@ -33,6 +33,12 @@ default = ["ndarray", "train", "native"]
 ndarray = ["burn/ndarray"]
 wgpu    = ["burn/wgpu"]
 
+# Opt in to `wgpu` on wasm32, which is refused without it. The combination
+# compiles and the async API it needs exists, but it has never been executed on
+# a GPU in a browser — see the feature table in `src/lib.rs` and issue #5. The
+# name is the warning: do not enable it and then report the result as tested.
+wgpu-wasm-unverified = ["wgpu"]
+
 # Few-shot training (contrastive body fine-tune + head fit). Works on wasm.
 train = ["burn/autodiff", "dep:rand"]
 

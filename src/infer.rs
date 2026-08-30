@@ -11,6 +11,7 @@ use crate::config::ClassifierConfig;
 use crate::error::Result;
 use crate::head::TaskMode;
 use crate::model::SetFitModule;
+use crate::readback::{self, blocking};
 use crate::reduce::{DocAccumulator, Reducer};
 use crate::tokenize::{Tokenizer, pad_batch};
 use burn::tensor::backend::Backend;
@@ -245,6 +246,18 @@ impl<B: Backend> Classifier<B> {
         self.classify_stream(core::iter::once(text.to_string()))
     }
 
+    /// [`Self::classify`], awaiting the device instead of blocking on it.
+    ///
+    /// Same result, and the same work: this is the implementation, and the
+    /// synchronous method above is a wrapper that drives it to completion.
+    /// Reach for this one on `wasm32` with a GPU backend, where blocking is
+    /// not available and the wrapper can only report that — see
+    /// [`SetFitError::Readback`](crate::SetFitError::Readback).
+    pub async fn classify_async(&self, text: &str) -> Result<Prediction> {
+        self.classify_stream_async(core::iter::once(text.to_string()))
+            .await
+    }
+
     /// Classify a document arriving in pieces.
     ///
     /// The source is consumed lazily and may be arbitrarily long: chunks are
@@ -268,6 +281,14 @@ impl<B: Backend> Classifier<B> {
     /// # }
     /// ```
     pub fn classify_stream<I: Iterator<Item = String>>(&self, source: I) -> Result<Prediction> {
+        blocking("classifying a document", self.classify_stream_async(source))
+    }
+
+    /// [`Self::classify_stream`], awaiting the device instead of blocking on it.
+    pub async fn classify_stream_async<I: Iterator<Item = String>>(
+        &self,
+        source: I,
+    ) -> Result<Prediction> {
         let num_labels = self.cfg().num_labels();
         let mut accumulator =
             DocAccumulator::new(self.cfg().reducer, self.cfg().hierarchy_fanout, num_labels);
@@ -281,12 +302,14 @@ impl<B: Backend> Classifier<B> {
         for chunk in chunker {
             batch.push(chunk?);
             if batch.len() == self.batch_size {
-                self.run_batch(&batch, &mut accumulator, &mut evidence)?;
+                self.run_batch(&batch, &mut accumulator, &mut evidence)
+                    .await?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            self.run_batch(&batch, &mut accumulator, &mut evidence)?;
+            self.run_batch(&batch, &mut accumulator, &mut evidence)
+                .await?;
         }
 
         let logits = accumulator.finish();
@@ -310,7 +333,7 @@ impl<B: Backend> Classifier<B> {
     }
 
     /// Encode one batch of chunks and fold their scores in.
-    fn run_batch(
+    async fn run_batch(
         &self,
         batch: &[Chunk],
         accumulator: &mut DocAccumulator,
@@ -324,10 +347,7 @@ impl<B: Backend> Classifier<B> {
         );
 
         let logits = self.module.forward(input_ids, attention_mask);
-        let data = logits
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|e| crate::SetFitError::Store(format!("{e:?}")))?;
+        let data = readback::floats(logits).await?;
 
         let num_labels = self.cfg().num_labels();
         for (i, chunk) in batch.iter().enumerate() {
@@ -388,6 +408,11 @@ impl<B: Backend> Classifier<B> {
     /// # }
     /// ```
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        blocking("embedding a batch", self.embed_async(texts))
+    }
+
+    /// [`Self::embed`], awaiting the device instead of blocking on it.
+    pub async fn embed_async(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         // An empty batch would reach the encoder as a zero-row tensor and panic
         // inside the backend rather than returning nothing.
         if texts.is_empty() {
@@ -406,10 +431,7 @@ impl<B: Backend> Classifier<B> {
         );
         let embeddings = self.module.embed(input_ids, attention_mask);
         let dim = embeddings.dims()[1];
-        let data = embeddings
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|e| crate::SetFitError::Store(format!("{e:?}")))?;
+        let data = readback::floats(embeddings).await?;
 
         Ok(data.chunks(dim).map(<[f32]>::to_vec).collect())
     }

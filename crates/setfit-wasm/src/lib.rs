@@ -11,6 +11,22 @@
 //! a minute of fine-tuning does not become a minute of frozen tab. The equivalent
 //! `fit()` convenience is deliberately absent — it would only ever be the wrong
 //! thing to call from the main thread.
+//!
+//! # Why the backend is `NdArray`
+//!
+//! Not a default anyone settled for: a GPU backend cannot be driven through the
+//! synchronous methods used below. WebGPU has no blocking readback, so on
+//! `wasm32` those return `SetFitError::Readback`, and lazy `WgpuDevice`
+//! acquisition traps earlier still, while the first tensor is being built.
+//!
+//! `burn-setfit` grew an `_async` twin for every method that reads a tensor, so
+//! the library side of that is solved. Reaching it from here is a separate
+//! piece of work: the constructors and `step` would have to become
+//! `Promise`-returning through `wasm-bindgen-futures`, and something would need
+//! to call `burn::backend::wgpu::init_setup_async` before the first tensor
+//! exists. Until that is written *and run against a real GPU*, this binding
+//! stays on the backend that is actually tested. See
+//! [#5](https://github.com/jcorrie/burn-setfit/issues/5).
 
 use burn::backend::{Autodiff, NdArray};
 use burn_setfit::{

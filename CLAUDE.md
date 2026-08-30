@@ -11,13 +11,14 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-142 tests, about two seconds, no network. Stay in this loop. Anything touching
+148 tests, about two seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
 ```bash
 cargo clippy --all-targets --features ndarray,train,native   # expected: zero warnings
 cargo build --target wasm32-unknown-unknown --no-default-features --features ndarray,train
+cargo build --target wasm32-unknown-unknown --no-default-features --features wgpu-wasm-unverified,train
 cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
 ```
 
@@ -32,6 +33,12 @@ cd browser-test && node run.mjs     # see browser-test/README.md for the setup
 is easy to break by adding a dependency that assumes a filesystem or threads.
 `native` is the only feature allowed to do either, and it is confined to
 `Checkpoint::download`.
+
+The `wgpu-wasm-unverified` build is there to keep the async path honest: it is
+the only configuration where a blocking readback is a real failure rather than a
+slow one, so it catches an `into_data()` that crept back in. It has never been
+executed on a GPU — the feature's name is load-bearing, do not rename it to
+something reassuring.
 
 ## Things that will bite
 
@@ -75,6 +82,24 @@ test names are given so a failure is self-explaining.
 - **`min_final_tokens` governs the trailing chunk only.** Intermediate windows are
   boundary-aligned and routinely short; a blanket minimum would discard ordinary
   content.
+
+- **`Tensor::into_data()` is a panic on wasm with a GPU backend.** It polls the
+  read future once and gives up; a browser cannot block on a buffer map, so the
+  future is always pending there. Lazy `WgpuDevice` acquisition goes through the
+  same `block_on`, which is why the trap lands while a tensor is being *built*,
+  before any readback, and reports only `unreachable`. Every readback therefore
+  goes through `src/readback.rs`, and the `_async` methods are the real
+  implementations with the blocking ones as wrappers — write a new one that way
+  round, or the two paths drift. Guards:
+  `tests/async_api.rs::classify_async_agrees_with_classify`,
+  `tests/async_api.rs::stepping_asynchronously_trains_the_same_model`.
+
+- **An `async fn` that awaits itself does not compile.** `step()` used to recurse
+  into itself to hand the caller a head step once the body stage ended; the
+  future that produces would be infinitely sized. The stage transition is a
+  fall-through in `step_async` for that reason, with the epoch bookkeeping
+  pulled out into `body_epoch_rollover` so it happens before any future exists.
+  Guard: `tests/async_api.rs::step_async_crosses_the_body_to_head_boundary`.
 
 ## Conventions
 

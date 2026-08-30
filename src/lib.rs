@@ -106,29 +106,40 @@
 //! | Feature | Purpose | wasm |
 //! | ------- | ------- | ---- |
 //! | `ndarray` | CPU backend | yes |
-//! | `wgpu` | GPU backend, native only | **no** |
+//! | `wgpu` | GPU backend | native, or opt in below |
+//! | `wgpu-wasm-unverified` | `wgpu` on `wasm32`, never executed | yes |
 //! | `train` | Both training stages | yes |
 //! | `native` | HuggingFace download, filesystem | **no** |
-//!
-//! Two features cannot go to wasm, for unrelated reasons.
 //!
 //! `native` is filesystem and network, and is confined to
 //! [`Checkpoint::download`] for that reason. Everything else — including both
 //! training stages — is byte-oriented and target-agnostic.
 //!
-//! `wgpu` is refused on `wasm32` at compile time, because this crate's API is
-//! synchronous and WebGPU's is not. Reading a tensor back from a GPU buffer in
-//! a browser is inherently async: there is no way to block on the buffer map,
-//! so Burn's `into_data()` polls the future once, finds it pending, and panics.
-//! Device acquisition has the same shape — `WgpuDevice` is initialised lazily
-//! through `block_on`, so merely constructing a tensor traps before any
-//! readback happens. Neither is a bug we can fix from this side of
-//! [`Tensor::into_data`]; both need `into_data_async` and an API that can await
-//! it. Natively `wgpu` is fine, because there blocking on a future is allowed.
+//! # A GPU backend in a browser
 //!
-//! Compiling the combination and discovering this at runtime costs a browser
-//! session and produces an unresolvable `unreachable` trap, so the guard below
-//! rejects it during the build instead. See
+//! WebGPU has no synchronous readback. A browser cannot block a thread on a GPU
+//! buffer map, so Burn's `Tensor::into_data()` polls the map future once, finds
+//! it pending and panics. Lazy `WgpuDevice` acquisition goes through the same
+//! `block_on`, so the trap arrives even earlier — while a tensor is being
+//! built, before anything is read.
+//!
+//! Every method here that reads a tensor therefore has an `_async` twin:
+//! [`Classifier::classify_async`], [`Classifier::classify_stream_async`],
+//! [`Classifier::embed_async`], [`Trainer::step_async`],
+//! [`Trainer::fit_with_async`]. Those are the implementations. The synchronous
+//! methods are wrappers that drive them to completion, which natively always
+//! works and on `wasm32` succeeds only for a backend whose reads finish
+//! immediately — `ndarray` does, a GPU backend does not. Where the wrapper
+//! cannot wait it returns [`SetFitError::Readback`] naming the `_async` method,
+//! rather than panicking inside Burn.
+//!
+//! Two things remain the caller's job on that target. The device must be
+//! brought up before any tensor exists, with
+//! `burn::backend::wgpu::init_setup_async`, because the lazy path cannot work.
+//! And `wasm32` with `wgpu` must be asked for explicitly, through
+//! `wgpu-wasm-unverified`: the combination compiles and the API it needs is
+//! here, but it has never been run on a GPU in a browser, and the feature is
+//! named so that enabling it cannot be mistaken for evidence that it has. See
 //! [#5](https://github.com/jcorrie/burn-setfit/issues/5).
 //!
 //! Items that need a feature are labelled as such in the rendered docs, so an
@@ -139,18 +150,24 @@
 // feature labels. Nothing here changes for an ordinary build.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-// A GPU backend on wasm32 cannot work while this crate's API is synchronous:
-// both device init and tensor readback go through `block_on`, which on wasm is
-// `poll_once` and panics the moment the future is actually pending. Nothing
-// fails to compile without this guard — the combination builds cleanly and
-// then traps in the browser with no usable message — which is exactly why it
-// is stated here rather than left to the docs. See the feature table above.
-#[cfg(all(feature = "wgpu", target_arch = "wasm32"))]
+// A GPU backend on wasm32 is reachable only through the `_async` methods, and
+// only after the caller has brought the device up by hand. Nothing fails to
+// compile if neither happens — the combination builds cleanly and then traps in
+// the browser with no usable message — so it is gated on an opt-in whose name
+// says what is being opted into. See the feature table above.
+#[cfg(all(
+    feature = "wgpu",
+    target_arch = "wasm32",
+    not(feature = "wgpu-wasm-unverified")
+))]
 compile_error!(
-    "the `wgpu` feature does not work on wasm32: WebGPU readback and device \
-     init are both async, and this crate's API is synchronous, so it traps at \
-     runtime rather than failing here. Build wasm with `ndarray`, or use \
-     `wgpu` on a native target. See https://github.com/jcorrie/burn-setfit/issues/5"
+    "`wgpu` on wasm32 needs the `wgpu-wasm-unverified` feature. WebGPU readback \
+     and device init are both async, so on this target the backend works only \
+     through the `_async` methods, and only if you call \
+     `burn::backend::wgpu::init_setup_async` before building any tensor; the \
+     blocking methods report `SetFitError::Readback` instead. The combination \
+     has never been executed on a GPU. Build wasm with `ndarray` for the tested \
+     path. See https://github.com/jcorrie/burn-setfit/issues/5"
 );
 
 pub mod bundle;
@@ -162,6 +179,7 @@ pub mod head;
 pub mod infer;
 pub mod minilm;
 pub mod model;
+mod readback;
 pub mod reduce;
 pub mod tokenize;
 #[cfg(feature = "train")]

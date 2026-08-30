@@ -74,6 +74,14 @@ pub enum SetFitError {
     /// which reports its own file failures through [`SetFitError::Download`]
     /// with the path attached. The source error is kept intact.
     Io(std::io::Error),
+    /// A tensor could not be brought back from the device.
+    ///
+    /// Either the device faulted, or — the interesting case — the result was
+    /// not ready and this target cannot wait for it. A browser cannot block on
+    /// a GPU buffer map, so every synchronous method here fails this way on
+    /// `wasm32` with a GPU backend, naming the `_async` method that works.
+    /// Natively the wait is allowed, so only a genuine device fault surfaces.
+    Readback(String),
 }
 
 impl fmt::Display for SetFitError {
@@ -86,6 +94,7 @@ impl fmt::Display for SetFitError {
             SetFitError::Download(m) => write!(f, "download error: {m}"),
             SetFitError::Training(m) => write!(f, "training error: {m}"),
             SetFitError::Io(e) => write!(f, "io error: {e}"),
+            SetFitError::Readback(m) => write!(f, "readback error: {m}"),
         }
     }
 }
