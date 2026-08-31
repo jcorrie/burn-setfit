@@ -45,3 +45,4 @@ that is the part of #1 still open.
 | Every held-in example classifies to its own label | Proves the whole chain ran, not merely that it returned |
 | The long document produced more than one chunk | The chunker and the reducer are on the path, not just a single forward pass |
 | Worst main-thread frame gap < 250 ms | The reason `Trainer` is a step-wise state machine rather than a `fit()` loop. A CSS animation would not prove this: it can run on the compositor thread while the main thread is wedged, so the harness clocks `requestAnimationFrame` on the main thread instead |
+| A backend this build cannot run is refused, by name and with a reason | The failure mode is a caller who asks for the GPU, is quietly given the CPU, and reads the timings as GPU timings. Checked on `requireBackend` and on the `Trainer` constructor, since the helper is the easier one to forget to call |
