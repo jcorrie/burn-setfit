@@ -22,6 +22,20 @@ cargo build --target wasm32-unknown-unknown --no-default-features --features wgp
 cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
 ```
 
+The `wgpu` backend has its own suite, kept out of the default run because it
+needs the feature and a Vulkan adapter:
+
+```bash
+cargo test --features ndarray,wgpu,train --test wgpu    # 4 tests, ~20 s
+```
+
+No GPU is needed. Mesa's lavapipe (`apt-get install mesa-vulkan-drivers`,
+providing `/usr/share/vulkan/icd.d/lvp_icd.json`) is a software Vulkan 1.4
+implementation, and wgpu runs on it as `llvmpipe`, `device_type: Cpu`. That
+exercises the whole backend — naga codegen, buffers, dispatch, readback — and
+is what catches a wgpu path that does not run or disagrees with `ndarray`. It
+proves nothing about real hardware or about WebGPU in a browser.
+
 Before anything that touches the browser path, run the harness — it catches what
 compiling cannot:
 

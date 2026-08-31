@@ -25,8 +25,9 @@ verified, and what is not, matters more than a version number here:
 
 | | |
 | --- | --- |
-| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 148 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). |
-| **Compiles, never run** | The `wgpu` backend, on any target ([#5]). On `wasm32` it also needs an explicit opt-in — see [Features](#features). |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 152 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). Native `wgpu` trains and classifies, and agrees with `NdArray` ([#5]). |
+| **Run on software Vulkan only** | `wgpu` — the suite passes on Mesa's lavapipe (`llvmpipe`, `device_type: Cpu`), which exercises the whole backend but is not hardware ([#5]). |
+| **Compiles, never run** | `wgpu` on `wasm32`, i.e. WebGPU in a browser. Needs an explicit opt-in — see [Features](#features). |
 | **Runs, but not against the real model** | The browser path, which has only been driven with a 146 KB stand-in checkpoint ([#1]). |
 | **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
 
@@ -171,7 +172,7 @@ cargo test --doc --features ndarray,train,native
 
 ## Tests
 
-148 tests, none needing a network. What each file is for:
+152 tests, none needing a network. What each file is for:
 
 | File | Covers |
 | ---- | ------ |
@@ -183,6 +184,7 @@ cargo test --doc --features ndarray,train,native
 | `tests/train.rs` | Data validation, the training state machine, reproducibility |
 | `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
 | `tests/async_api.rs` | That the `_async` methods and their blocking wrappers agree exactly |
+| `tests/wgpu.rs` | That the `wgpu` backend runs at all, and agrees with `ndarray` (needs `--features wgpu`) |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
 
@@ -358,7 +360,7 @@ model class, no LBFGS to reimplement, and it trains on every Burn backend.
 | Feature   | Purpose                            | wasm | Exercised by tests |
 | --------- | ---------------------------------- | ---- | ------------------ |
 | `ndarray` | CPU backend                        | yes  | yes                |
-| `wgpu`    | GPU backend                        | opt-in below | **no** — compiles only, see [#5] |
+| `wgpu`    | GPU backend                        | opt-in below | yes — `--test wgpu`, on software Vulkan |
 | `wgpu-wasm-unverified` | `wgpu` on `wasm32`    | yes  | **no** — never executed |
 | `train`   | Both training stages               | yes  | yes                |
 | `native`  | HuggingFace download, filesystem   | no   | yes (`--ignored`)  |
