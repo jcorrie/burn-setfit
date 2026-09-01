@@ -18,6 +18,7 @@ use crate::error::{Result, SetFitError};
 use crate::head::{SetFitHead, SetFitHeadConfig, TaskMode};
 use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant, check_sequence_budget};
 use crate::model::{SetFitModule, embed_body};
+use crate::quantize::Quantization;
 use crate::readback::{self, blocking};
 use crate::tokenize::pad_batch;
 use burn::module::AutodiffModule;
@@ -677,6 +678,18 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// [`Self::into_model`] instead to inspect a partially trained model
     /// deliberately.
     pub fn finish(self) -> Result<Vec<u8>> {
+        self.finish_quantized(Quantization::None)
+    }
+
+    /// [`Self::finish`], storing the weights at a lower precision.
+    ///
+    /// The weights dominate a bundle — 86.5 MB against 8.5 MB of wasm for
+    /// MiniLM-L6 — so this is the difference between a download a browser
+    /// tolerates and one it does not. It changes the file only: the model is
+    /// expanded back to `f32` when it loads, and classifies on every backend
+    /// exactly as it did before. What it costs is precision, which
+    /// `examples/quantize.rs` measures rather than assumes.
+    pub fn finish_quantized(self, quantization: Quantization) -> Result<Vec<u8>> {
         if self.stage != Stage::Done {
             return Err(SetFitError::Training(format!(
                 "training is still in the {:?} stage at step {} of {}; \
@@ -691,7 +704,8 @@ impl<B: AutodiffBackend> Trainer<B> {
             self.variant,
             self.body_config.clone(),
             self.classifier.clone(),
-        );
+        )
+        .with_quantization(quantization);
         let tokenizer_json = self.tokenizer_json.clone();
         Bundle::pack(&self.into_model(), &manifest, &tokenizer_json)
     }

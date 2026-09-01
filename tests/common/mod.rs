@@ -169,6 +169,34 @@ pub fn toy_bundle(classifier: burn_setfit::config::ClassifierConfig) -> Vec<u8> 
     built
 }
 
+/// [`toy_bundle`]'s model, repacked at the given precision.
+///
+/// Repacked rather than retrained, and that distinction is the whole point.
+/// `toy_checkpoint` initialises randomly, so training once per precision would
+/// produce a different model each time and any comparison across precisions
+/// would be measuring initialisation noise rather than quantization. One model
+/// goes in; only the storage differs.
+pub fn toy_bundle_quantized(
+    classifier: burn_setfit::config::ClassifierConfig,
+    quantization: burn_setfit::quantize::Quantization,
+) -> Vec<u8> {
+    use burn::backend::NdArray;
+    use burn_setfit::bundle::Bundle;
+    use burn_setfit::quantize::Quantization;
+
+    let plain = toy_bundle(classifier);
+    if quantization == Quantization::None {
+        return plain;
+    }
+
+    let bundle = Bundle::unpack(&plain).expect("the toy bundle unpacks");
+    let module = bundle
+        .load_module::<NdArray<f32>>(&Default::default())
+        .expect("the toy model loads");
+    let manifest = bundle.manifest.clone().with_quantization(quantization);
+    Bundle::pack(&module, &manifest, &bundle.tokenizer).expect("repacking succeeds")
+}
+
 fn train_toy_bundle(classifier: burn_setfit::config::ClassifierConfig) -> Vec<u8> {
     use burn::backend::{Autodiff, NdArray};
     use burn_setfit::train::Trainer;

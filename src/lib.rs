@@ -179,6 +179,7 @@ pub mod head;
 pub mod infer;
 pub mod minilm;
 pub mod model;
+pub mod quantize;
 mod readback;
 pub mod reduce;
 pub mod tokenize;

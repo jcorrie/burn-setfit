@@ -28,7 +28,7 @@ verified, and what is not, matters more than a version number here:
 | **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 152 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). Native `wgpu` trains and classifies, and agrees with `NdArray` ([#5]). |
 | **Run on software Vulkan only** | `wgpu` — the suite passes on Mesa's lavapipe (`llvmpipe`, `device_type: Cpu`), which exercises the whole backend but is not hardware ([#5]). |
 | **Compiles, never run** | `wgpu` on `wasm32`, i.e. WebGPU in a browser. Needs an explicit opt-in — see [Features](#features). |
-| **Runs, but not against the real model** | The browser path, which has only been driven with a 146 KB stand-in checkpoint ([#1]). |
+| **Reported, not reproduced here** | The real model in a real browser: the maintainer runs this client-side in an Excel add-in on `NdArray` ([#1]). The repository's own harness still only drives a 146 KB stand-in. |
 | **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
 
 Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
@@ -184,6 +184,8 @@ cargo test --doc --features ndarray,train,native
 | `tests/train.rs` | Data validation, the training state machine, reproducibility |
 | `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
 | `tests/async_api.rs` | That the `_async` methods and their blocking wrappers agree exactly |
+| `tests/quantize.rs` | That every precision round-trips, shrinks, and stays close to fp32 |
+| `tests/wgpu.rs` | The `wgpu` backend against `ndarray` (needs the feature) |
 | `tests/wgpu.rs` | That the `wgpu` backend runs at all, and agrees with `ndarray` (needs `--features wgpu`) |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
@@ -296,8 +298,34 @@ The `tokenizers` rayon worry that shaped `src/tokenize.rs` looks unfounded on
 this evidence — the single-sequence `encode` path runs fine in a browser. That
 is not a licence to reach for `encode_batch`, which remains untested there.
 
-Still open ([#1]): every browser number above comes from a 32-wide toy
-checkpoint. Fidelity in a browser needs the real 86.5 MB model.
+The numbers above come from a 32-wide toy checkpoint, so they measure the
+machinery rather than the model. The remaining question in [#1] — whether the
+real thing runs in a real browser — is answered separately and not by this
+harness: the maintainer runs this crate client-side in a production Excel
+add-in on `NdArray`. That is a report rather than something CI reproduces, and
+it is recorded as one.
+
+### Payload
+
+The two things a browser downloads, and what can be done about them:
+
+```bash
+cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
+wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int \
+  target/wasm32-unknown-unknown/release/setfit_wasm.wasm -o setfit_wasm.min.wasm
+```
+
+| | Before | After |
+| --- | --- | --- |
+| wasm (`wasm-opt -Oz`) | 8.45 MB | **5.78 MB** (−32%) |
+| bundle (`Quantization::F16`) | 86.1 MB | **43.1 MB** (−50%) |
+| bundle (`Quantization::Int8`) | 86.1 MB | **21.8 MB** (−75%) |
+
+`wasm-opt` takes about five minutes on this artifact, which is why it is a
+release step rather than part of the build. Quantization is a decode-time
+non-event: weights are expanded back to `f32` before Burn sees them, so the
+model computes identically on every backend — see [Quantization](#quantization)
+for what it costs.
 
 Training yields between steps, so a browser stays responsive:
 
@@ -354,6 +382,52 @@ models by their tensors; content-addressing a bundle will not work.
 **The head is `use_differentiable_head`**, SetFit's own alternative to the sklearn
 `LogisticRegression` default: a `Linear` layer with AdamW and weight decay. Same
 model class, no LBFGS to reimplement, and it trains on every Burn backend.
+
+## Quantization
+
+The weights are the payload: 86.1 MB against 8.5 MB of wasm. Roughly half of
+MiniLM-L6's 22.7M parameters are one `30522 x 384` embedding table, which is
+exactly the kind of tensor that survives losing precision.
+
+```rust
+let bundle = trainer.finish_quantized(Quantization::F16)?;
+```
+
+| Mode | Bundle | vs fp32 |
+| ---- | ------ | ------- |
+| `none` | 86.1 MB | 100% |
+| `f16`  | 43.1 MB | **50%** |
+| `int8` | 21.8 MB | **25%** |
+
+Measured with `cargo run --release --example quantize -- --sizes`. Bundle size
+depends only on tensor *shapes*, so those figures are exact for MiniLM-L6
+whatever the weights happen to be.
+
+**This is storage, not compute.** Burn's `Tensor::quantize` produces a `QFloat`
+that arithmetic runs *on*, which needs quantized-op support from every backend
+and changes what the model computes. What is wanted here is a smaller download,
+so weights are compressed when a bundle is packed and expanded back to `f32`
+before Burn sees them. Inference is the same code on every backend and the only
+cost is the precision lost in the round trip.
+
+Not everything is compressed, and that is the point: rank-2-and-up float tensors
+above a size floor, which is the embedding table and the `Linear` weights.
+LayerNorm gains and biases are rank 1, tiny, and the parameters least tolerant
+of precision loss, so they stay `f32`. `int8` is scaled per row rather than per
+tensor — the embedding table's rows are individual tokens, and one shared scale
+would let the largest vector in the vocabulary set the resolution for all 30522.
+
+A quantized bundle declares format version 2, so an older build refuses it
+outright instead of reading `f16` bytes as though they were `f32`. Unquantized
+bundles are still version 1 and unchanged.
+
+**What is not measured here.** Accuracy deviation on the real checkpoint is
+still open in [#2]: `cargo run --release --example quantize` reports it — score
+drift, cosine drift and held-out probes against the fp32 baseline — but it needs
+to download `all-MiniLM-L6-v2`, which the environment this was developed in
+could not reach. `tests/quantize.rs` bounds the drift on the toy model
+(f16 ~1e-5, int8 ~1e-4 on scores), which is enough to catch corruption and not
+enough to justify a number in this table.
 
 ## Features
 
@@ -415,6 +489,7 @@ Two things stay the caller's job on that target:
 | `src/bundle.rs` | The `.setfit` container |
 | `src/infer.rs` | `Classifier`, decoding, evidence |
 | `src/readback.rs` | Getting tensors off the device. Read it before adding an `into_data` |
+| `src/quantize.rs` | Narrowing weights at rest. Storage only — never what the model computes |
 | `src/minilm/` | Vendored MiniLM body — see [#3] before touching |
 | `crates/setfit-wasm/` | Browser bindings |
 
