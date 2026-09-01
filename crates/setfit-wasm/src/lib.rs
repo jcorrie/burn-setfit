@@ -11,6 +11,29 @@
 //! a minute of fine-tuning does not become a minute of frozen tab. The equivalent
 //! `fit()` convenience is deliberately absent — it would only ever be the wrong
 //! thing to call from the main thread.
+//!
+//! **The backend is named.** [`active_backend`] and [`available_backends`]
+//! report what this build actually runs on, and both constructors take an
+//! optional backend name that is refused if it is one this build cannot
+//! honour. Nothing here silently downgrades a GPU request to the CPU: a caller
+//! who believes they configured a GPU and reads the timings as GPU timings is
+//! worse off than one who got an error.
+//!
+//! # Why the backend is `NdArray`
+//!
+//! Not a default anyone settled for: a GPU backend cannot be driven through the
+//! synchronous methods used below. WebGPU has no blocking readback, so on
+//! `wasm32` those return `SetFitError::Readback`, and lazy `WgpuDevice`
+//! acquisition traps earlier still, while the first tensor is being built.
+//!
+//! `burn-setfit` grew an `_async` twin for every method that reads a tensor, so
+//! the library side of that is solved. Reaching it from here is a separate
+//! piece of work: the constructors and `step` would have to become
+//! `Promise`-returning through `wasm-bindgen-futures`, and something would need
+//! to call `burn::backend::wgpu::init_setup_async` before the first tensor
+//! exists. Until that is written *and run against a real GPU*, this binding
+//! stays on the backend that is actually tested. See
+//! [#5](https://github.com/jcorrie/burn-setfit/issues/5).
 
 use burn::backend::{Autodiff, NdArray};
 use burn_setfit::{
@@ -29,6 +52,79 @@ type AB = Autodiff<B>;
 pub fn start() {
     #[cfg(feature = "console_error_panic_hook")]
     console_error_panic_hook::set_once();
+}
+
+/// The backend this build runs on.
+///
+/// One entry, deliberately. It is exposed as a name so a caller can *ask*
+/// rather than assume: silently running on the CPU when the caller believes
+/// they configured a GPU is the failure this exists to prevent.
+const ACTIVE_BACKEND: &str = "ndarray";
+
+/// Backends a caller might reasonably name, and why this build cannot run them.
+///
+/// Naming them beats a bare "unknown backend": every one of these is a
+/// reasonable thing to ask for, and the answer is a limitation rather than a
+/// typo. Keep the reasons specific — the whole point is that the caller learns
+/// something they can act on.
+const UNIMPLEMENTED_BACKENDS: &[(&str, &str)] = &[
+    (
+        "wgpu",
+        "WebGPU has no synchronous readback and its device init is async, but \
+         these bindings are synchronous. `burn-setfit` has an `_async` method \
+         behind every readback, so the library side is ready; reaching it from \
+         here needs Promise-returning constructors via wasm-bindgen-futures and \
+         a call to `burn::backend::wgpu::init_setup_async` before the first \
+         tensor exists. That is unwritten, and has never been run on a GPU",
+    ),
+    (
+        "webgpu",
+        "spelled `wgpu` in Burn, and not implemented here either",
+    ),
+    (
+        "metal",
+        "a native Burn backend, not reachable from wasm32. In a browser, Apple \
+         hardware is reached through WebGPU, which Safari implements on top of \
+         Metal — so the backend to ask for would be `wgpu`, which is also not \
+         implemented here",
+    ),
+    ("cuda", "a native Burn backend, not reachable from wasm32"),
+];
+
+/// The backends this build can actually run.
+#[wasm_bindgen(js_name = availableBackends)]
+pub fn available_backends() -> Vec<String> {
+    vec![ACTIVE_BACKEND.to_string()]
+}
+
+/// The backend this build is running on, whatever was asked for.
+#[wasm_bindgen(js_name = activeBackend)]
+pub fn active_backend() -> String {
+    ACTIVE_BACKEND.to_string()
+}
+
+/// Fail unless `requested` names a backend this build can run.
+///
+/// `None` means the caller expressed no preference and gets the default. A name
+/// this build cannot honour is an error rather than a silent downgrade, because
+/// the alternative is a caller who thinks they are on a GPU and is not.
+#[wasm_bindgen(js_name = requireBackend)]
+pub fn require_backend(requested: Option<String>) -> Result<String, JsValue> {
+    let Some(requested) = requested else {
+        return Ok(ACTIVE_BACKEND.to_string());
+    };
+    let name = requested.trim().to_ascii_lowercase();
+    if name == ACTIVE_BACKEND {
+        return Ok(ACTIVE_BACKEND.to_string());
+    }
+    let detail = match UNIMPLEMENTED_BACKENDS.iter().find(|(n, _)| *n == name) {
+        Some((_, why)) => format!("backend `{name}` is not implemented in this build: {why}"),
+        None => format!("unknown backend `{name}`"),
+    };
+    Err(JsValue::from_str(&format!(
+        "{detail}. This build runs on `{ACTIVE_BACKEND}`. \
+         See https://github.com/jcorrie/burn-setfit/issues/5"
+    )))
 }
 
 fn js_err(e: impl core::fmt::Display) -> JsValue {
@@ -68,8 +164,13 @@ pub struct Classifier {
 #[wasm_bindgen]
 impl Classifier {
     /// Load from `.setfit` bundle bytes.
+    ///
+    /// `backend` is optional and defaults to the only one this build has. Pass
+    /// it to be *told* when the backend you want is unavailable, instead of
+    /// quietly getting a different one — see [`require_backend`].
     #[wasm_bindgen(constructor)]
-    pub fn new(bundle: &[u8]) -> Result<Classifier, JsValue> {
+    pub fn new(bundle: &[u8], backend: Option<String>) -> Result<Classifier, JsValue> {
+        require_backend(backend)?;
         Ok(Classifier {
             inner: CoreClassifier::from_bundle(bundle, Default::default()).map_err(js_err)?,
         })
@@ -136,6 +237,10 @@ struct JsTrainRequest {
     head_epochs: Option<usize>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Optional. Named so a caller who wants a GPU is told this build has none,
+    /// rather than training on the CPU believing otherwise.
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 /// Progress from a single training step.
@@ -169,6 +274,9 @@ impl Trainer {
         request_json: &str,
     ) -> Result<Trainer, JsValue> {
         let request: JsTrainRequest = serde_json::from_str(request_json).map_err(js_err)?;
+        // Before the checkpoint is parsed: a caller who asked for the wrong
+        // backend should hear about it immediately, not after 90 MB of weights.
+        require_backend(request.backend)?;
 
         let checkpoint =
             Checkpoint::from_files(MiniLmVariant::L6, config_json, weights, tokenizer_json)

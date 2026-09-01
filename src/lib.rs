@@ -106,13 +106,41 @@
 //! | Feature | Purpose | wasm |
 //! | ------- | ------- | ---- |
 //! | `ndarray` | CPU backend | yes |
-//! | `wgpu` | GPU backend (WebGPU in browsers) | yes |
+//! | `wgpu` | GPU backend | native, or opt in below |
+//! | `wgpu-wasm-unverified` | `wgpu` on `wasm32`, never executed | yes |
 //! | `train` | Both training stages | yes |
 //! | `native` | HuggingFace download, filesystem | **no** |
 //!
-//! `native` is the only feature that cannot go to wasm, and it is confined to
+//! `native` is filesystem and network, and is confined to
 //! [`Checkpoint::download`] for that reason. Everything else — including both
 //! training stages — is byte-oriented and target-agnostic.
+//!
+//! # A GPU backend in a browser
+//!
+//! WebGPU has no synchronous readback. A browser cannot block a thread on a GPU
+//! buffer map, so Burn's `Tensor::into_data()` polls the map future once, finds
+//! it pending and panics. Lazy `WgpuDevice` acquisition goes through the same
+//! `block_on`, so the trap arrives even earlier — while a tensor is being
+//! built, before anything is read.
+//!
+//! Every method here that reads a tensor therefore has an `_async` twin:
+//! [`Classifier::classify_async`], [`Classifier::classify_stream_async`],
+//! [`Classifier::embed_async`], [`Trainer::step_async`],
+//! [`Trainer::fit_with_async`]. Those are the implementations. The synchronous
+//! methods are wrappers that drive them to completion, which natively always
+//! works and on `wasm32` succeeds only for a backend whose reads finish
+//! immediately — `ndarray` does, a GPU backend does not. Where the wrapper
+//! cannot wait it returns [`SetFitError::Readback`] naming the `_async` method,
+//! rather than panicking inside Burn.
+//!
+//! Two things remain the caller's job on that target. The device must be
+//! brought up before any tensor exists, with
+//! `burn::backend::wgpu::init_setup_async`, because the lazy path cannot work.
+//! And `wasm32` with `wgpu` must be asked for explicitly, through
+//! `wgpu-wasm-unverified`: the combination compiles and the API it needs is
+//! here, but it has never been run on a GPU in a browser, and the feature is
+//! named so that enabling it cannot be mistaken for evidence that it has. See
+//! [#5](https://github.com/jcorrie/burn-setfit/issues/5).
 //!
 //! Items that need a feature are labelled as such in the rendered docs, so an
 //! item that appears to be missing is a feature that is off rather than an API
@@ -121,6 +149,26 @@
 // docs.rs builds with `--cfg docsrs` (see Cargo.toml), which turns on the
 // feature labels. Nothing here changes for an ordinary build.
 #![cfg_attr(docsrs, feature(doc_cfg))]
+
+// A GPU backend on wasm32 is reachable only through the `_async` methods, and
+// only after the caller has brought the device up by hand. Nothing fails to
+// compile if neither happens — the combination builds cleanly and then traps in
+// the browser with no usable message — so it is gated on an opt-in whose name
+// says what is being opted into. See the feature table above.
+#[cfg(all(
+    feature = "wgpu",
+    target_arch = "wasm32",
+    not(feature = "wgpu-wasm-unverified")
+))]
+compile_error!(
+    "`wgpu` on wasm32 needs the `wgpu-wasm-unverified` feature. WebGPU readback \
+     and device init are both async, so on this target the backend works only \
+     through the `_async` methods, and only if you call \
+     `burn::backend::wgpu::init_setup_async` before building any tensor; the \
+     blocking methods report `SetFitError::Readback` instead. The combination \
+     has never been executed on a GPU. Build wasm with `ndarray` for the tested \
+     path. See https://github.com/jcorrie/burn-setfit/issues/5"
+);
 
 pub mod bundle;
 pub mod checkpoint;
@@ -131,6 +179,7 @@ pub mod head;
 pub mod infer;
 pub mod minilm;
 pub mod model;
+mod readback;
 pub mod reduce;
 pub mod tokenize;
 #[cfg(feature = "train")]

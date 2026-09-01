@@ -25,8 +25,9 @@ verified, and what is not, matters more than a version number here:
 
 | | |
 | --- | --- |
-| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 142 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). |
-| **Compiles, never run** | The `wgpu` backend ([#5]). |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 152 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). Native `wgpu` trains and classifies, and agrees with `NdArray` ([#5]). |
+| **Run on software Vulkan only** | `wgpu` — the suite passes on Mesa's lavapipe (`llvmpipe`, `device_type: Cpu`), which exercises the whole backend but is not hardware ([#5]). |
+| **Compiles, never run** | `wgpu` on `wasm32`, i.e. WebGPU in a browser. Needs an explicit opt-in — see [Features](#features). |
 | **Runs, but not against the real model** | The browser path, which has only been driven with a 146 KB stand-in checkpoint ([#1]). |
 | **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
 
@@ -171,7 +172,7 @@ cargo test --doc --features ndarray,train,native
 
 ## Tests
 
-142 tests, none needing a network. What each file is for:
+152 tests, none needing a network. What each file is for:
 
 | File | Covers |
 | ---- | ------ |
@@ -182,6 +183,8 @@ cargo test --doc --features ndarray,train,native
 | `tests/infer.rs` | Decoding, evidence, and invariance to batch size |
 | `tests/train.rs` | Data validation, the training state machine, reproducibility |
 | `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
+| `tests/async_api.rs` | That the `_async` methods and their blocking wrappers agree exactly |
+| `tests/wgpu.rs` | That the `wgpu` backend runs at all, and agrees with `ndarray` (needs `--features wgpu`) |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
 
@@ -357,12 +360,48 @@ model class, no LBFGS to reimplement, and it trains on every Burn backend.
 | Feature   | Purpose                            | wasm | Exercised by tests |
 | --------- | ---------------------------------- | ---- | ------------------ |
 | `ndarray` | CPU backend                        | yes  | yes                |
-| `wgpu`    | GPU backend (WebGPU in browsers)   | yes  | **no** — compiles only, see [#5] |
+| `wgpu`    | GPU backend                        | opt-in below | yes — `--test wgpu`, on software Vulkan |
+| `wgpu-wasm-unverified` | `wgpu` on `wasm32`    | yes  | **no** — never executed |
 | `train`   | Both training stages               | yes  | yes                |
 | `native`  | HuggingFace download, filesystem   | no   | yes (`--ignored`)  |
 
-`native` is the only feature that cannot go to wasm, and it is quarantined to one
-module for that reason — see the design notes.
+`native` is filesystem and network, and is quarantined to one module for that
+reason — see the design notes.
+
+### A GPU backend in a browser
+
+WebGPU has no synchronous readback. A browser cannot block a thread on a GPU
+buffer map, so Burn's `Tensor::into_data()` polls the map future once, finds it
+pending and panics. Lazy `WgpuDevice` acquisition goes through the same
+`block_on`, so the trap arrives even earlier — while a tensor is being built,
+before anything is read. The combination used to compile and then die in the
+browser as a bare `unreachable`, with nothing in the message naming the cause.
+
+Every method that reads a tensor now has an `_async` twin:
+
+```rust
+let prediction = classifier.classify_async(text).await?;
+let vectors    = classifier.embed_async(&texts).await?;
+while let Some(progress) = trainer.step_async().await? { /* ... */ }
+```
+
+Those are the implementations. The blocking methods are wrappers that drive them
+to completion, so there is one code path rather than two kept in step by hand —
+`tests/async_api.rs` holds them to identical results. Natively the wrapper
+always works. On `wasm32` it succeeds only for a backend whose reads finish
+immediately, which `ndarray` does and a GPU backend does not; where it cannot
+wait it returns `SetFitError::Readback` naming the `_async` method, instead of
+panicking inside Burn.
+
+Two things stay the caller's job on that target:
+
+- **Bring the device up first**, with `burn::backend::wgpu::init_setup_async`.
+  The lazy path cannot work, and without this the trap happens while the first
+  tensor is built, before any readback.
+- **Ask for it explicitly**, with `wgpu-wasm-unverified`. The combination
+  compiles and the API it needs is here, but it has never been run on a GPU in a
+  browser. The feature is named so that enabling it cannot be mistaken for
+  evidence that it has.
 
 ## Repository map
 
@@ -375,6 +414,7 @@ module for that reason — see the design notes.
 | `src/train.rs` | Both SetFit stages, as a step-wise state machine |
 | `src/bundle.rs` | The `.setfit` container |
 | `src/infer.rs` | `Classifier`, decoding, evidence |
+| `src/readback.rs` | Getting tensors off the device. Read it before adding an `into_data` |
 | `src/minilm/` | Vendored MiniLM body — see [#3] before touching |
 | `crates/setfit-wasm/` | Browser bindings |
 

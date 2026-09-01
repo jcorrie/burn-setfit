@@ -7,7 +7,7 @@
 // entropy through getrandom, autodiff, safetensors) and that the tab stays
 // responsive while it happens.
 
-import init, { Trainer, Classifier } from './pkg/setfit_wasm.js';
+import init, { Trainer, Classifier, activeBackend, availableBackends, requireBackend } from './pkg/setfit_wasm.js';
 
 const log = (msg) => {
   document.getElementById('log').textContent += msg + '\n';
@@ -86,6 +86,46 @@ async function main() {
     result.timings.wasm_init_ms = Math.round(performance.now() - t0);
     log(`wasm loaded in ${result.timings.wasm_init_ms} ms`);
 
+    // A backend this build cannot run must be refused, and refused by name. The
+    // failure this guards is a caller who asks for the GPU, is quietly given
+    // the CPU, and reports the timings as if they were GPU timings.
+    phase('checking backends');
+    result.backend = { active: activeBackend(), available: availableBackends() };
+    log(`backend: ${result.backend.active} (available: ${result.backend.available.join(', ')})`);
+
+    const refusals = {};
+    for (const name of ['wgpu', 'webgpu', 'metal', 'cuda', 'nonsense']) {
+      try {
+        requireBackend(name);
+        refusals[name] = null;
+        result.errors.push(`backend '${name}' was accepted but this build cannot run it`);
+      } catch (e) {
+        refusals[name] = String(e);
+      }
+    }
+    // The message has to say something useful, not just "no".
+    if (refusals.wgpu && !/async|readback/i.test(refusals.wgpu)) {
+      result.errors.push(`the wgpu refusal does not explain itself: ${refusals.wgpu}`);
+    }
+    result.backend.refusals = refusals;
+    log(`refused wgpu with: ${refusals.wgpu}`);
+
+    // And the refusal must reach the real entry points, not just the helper.
+    try {
+      new Trainer('{}', new Uint8Array(), new Uint8Array(),
+        JSON.stringify({ ...TRAIN_REQUEST, backend: 'wgpu' }));
+      result.errors.push('Trainer accepted backend wgpu');
+    } catch (e) {
+      log(`Trainer refused wgpu with: ${e}`);
+    }
+    // The named backend is checked before the checkpoint is parsed, so a
+    // deliberately empty config must still fail on the backend.
+    if (String(result.backend.refusals.wgpu).includes('undefined')) {
+      result.errors.push('refusal message is malformed');
+    }
+    // The backend this build does have stays accepted, including omitted.
+    requireBackend(activeBackend());
+
     phase('fetching checkpoint');
     const base = './checkpoint';
     const [configJson, weights, tokenizerJson] = await Promise.all([
@@ -131,7 +171,7 @@ async function main() {
     log(`bundle: ${bundle.length} bytes`);
 
     phase('classifying');
-    const classifier = new Classifier(bundle);
+    const classifier = new Classifier(bundle, activeBackend());
     result.labels = classifier.labels();
 
     const short = TRAIN_REQUEST.examples.map((e) => {

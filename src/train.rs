@@ -18,11 +18,11 @@ use crate::error::{Result, SetFitError};
 use crate::head::{SetFitHead, SetFitHeadConfig, TaskMode};
 use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant, check_sequence_budget};
 use crate::model::{SetFitModule, embed_body};
+use crate::readback::{self, blocking};
 use crate::tokenize::pad_batch;
 use burn::module::AutodiffModule;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::cast::ToElement;
 use burn::tensor::{Int, Tensor};
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -437,25 +437,57 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// Returns `None` once training is complete. Between calls the caller is free
     /// to do anything — yield to a browser's event loop, report progress, stop early.
     pub fn step(&mut self) -> Result<Option<Progress>> {
+        blocking("a training step", self.step_async())
+    }
+
+    /// [`Self::step`], awaiting the device instead of blocking on it.
+    ///
+    /// Same work, and this is where it lives: the synchronous [`Self::step`] is
+    /// a wrapper that drives this to completion. On `wasm32` with a GPU backend
+    /// that wrapper cannot block, so this is the only way to train there.
+    pub async fn step_async(&mut self) -> Result<Option<Progress>> {
+        // The body stage ends *inside* a step: the last contrastive batch is
+        // followed by embedding the whole training set, and the caller is owed
+        // the first head step from that same call. Written as a fall-through
+        // rather than the recursive `self.step()` this replaced, because an
+        // `async fn` that awaits itself has an infinitely sized future and
+        // needs boxing to compile at all.
+        if self.stage == Stage::Body {
+            if self.body_epoch_rollover() {
+                return Ok(Some(self.body_step().await?));
+            }
+            self.begin_head_stage().await?;
+        }
         match self.stage {
-            Stage::Body => self.body_step(),
-            Stage::Head => self.head_step(),
+            Stage::Head => self.head_step().await,
             Stage::Done => Ok(None),
+            Stage::Body => unreachable!("the body stage is left before this point"),
         }
     }
 
-    /// One contrastive step over a batch of pairs.
-    fn body_step(&mut self) -> Result<Option<Progress>> {
-        if self.cursor >= self.pairs.len() {
-            self.epoch += 1;
-            self.cursor = 0;
-            if self.epoch >= self.config.body_epochs {
-                self.begin_head_stage()?;
-                return self.step();
-            }
-            self.pairs.shuffle(&mut self.rng);
+    /// Roll the body stage's cursor over an epoch boundary.
+    ///
+    /// Returns whether a contrastive batch is still owed; `false` means the
+    /// stage is finished and the head should take over. Split out from the step
+    /// itself so the epoch bookkeeping happens once, before anything touches a
+    /// tensor and before there is a future to await.
+    fn body_epoch_rollover(&mut self) -> bool {
+        if self.cursor < self.pairs.len() {
+            return true;
         }
+        self.epoch += 1;
+        self.cursor = 0;
+        if self.epoch >= self.config.body_epochs {
+            return false;
+        }
+        self.pairs.shuffle(&mut self.rng);
+        true
+    }
 
+    /// One contrastive step over a batch of pairs.
+    ///
+    /// Assumes [`Self::body_epoch_rollover`] has just said a batch is owed.
+    async fn body_step(&mut self) -> Result<Progress> {
         let end = (self.cursor + self.config.body_batch_size).min(self.pairs.len());
         let batch = &self.pairs[self.cursor..end];
         self.cursor = end;
@@ -489,20 +521,24 @@ impl<B: AutodiffBackend> Trainer<B> {
         // SetFit's default objective: drive cosine similarity toward 1 for pairs
         // that share a label and toward 0 for pairs that do not.
         let loss = (cosine - targets).powf_scalar(2.0).mean();
-        let loss_value = scalar(&loss);
 
+        // Cloned before `backward` consumes it. The optimiser needs none of this
+        // on the host, so the read is deferred until after the step: the device
+        // gets the whole update queued in one go, and the wait pays for the
+        // progress report rather than for the training.
+        let reported = loss.clone();
         let grads = GradientsParams::from_grads(loss.backward(), &self.body);
         self.body = self
             .body_optim
             .step(self.config.body_lr, self.body.clone(), grads);
 
         self.step += 1;
-        Ok(Some(Progress {
+        Ok(Progress {
             stage: Stage::Body,
             step: self.step,
             total_steps: self.total_steps(),
-            loss: loss_value,
-        }))
+            loss: readback::scalar(reported).await?,
+        })
     }
 
     /// Freeze the body and embed every example once, ready for the head.
@@ -510,7 +546,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// This is the expensive transition: one forward pass over the whole training
     /// set. It happens inside a single `step()` call, so a browser sees one long
     /// step rather than a silent stall.
-    fn begin_head_stage(&mut self) -> Result<()> {
+    async fn begin_head_stage(&mut self) -> Result<()> {
         let frozen = self.body.valid();
         let mut embeddings = Vec::with_capacity(self.examples.len() * self.hidden_size);
 
@@ -518,12 +554,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let (input_ids, attention_mask) =
                 pad_batch::<B::InnerBackend>(batch, self.pad_id, &self.device);
             let embedded = embed_body(&frozen, input_ids, attention_mask);
-            embeddings.extend(
-                embedded
-                    .into_data()
-                    .into_vec::<f32>()
-                    .map_err(|e| SetFitError::Training(format!("{e:?}")))?,
-            );
+            embeddings.extend(readback::floats(embedded).await?);
         }
 
         self.embeddings = embeddings;
@@ -536,7 +567,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     /// One supervised step over a batch of frozen embeddings.
-    fn head_step(&mut self) -> Result<Option<Progress>> {
+    async fn head_step(&mut self) -> Result<Option<Progress>> {
         if self.cursor >= self.head_order.len() {
             self.epoch += 1;
             self.cursor = 0;
@@ -584,8 +615,8 @@ impl<B: AutodiffBackend> Trainer<B> {
                 self.head.multi_label_loss(logits, targets)
             }
         };
-        let loss_value = scalar(&loss);
-
+        // Read after the optimiser step, for the reason given in `body_step`.
+        let reported = loss.clone();
         let grads = GradientsParams::from_grads(loss.backward(), &self.head);
         self.head = self
             .head_optim
@@ -596,7 +627,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             stage: Stage::Head,
             step: self.step,
             total_steps: self.total_steps(),
-            loss: loss_value,
+            loss: readback::scalar(reported).await?,
         }))
     }
 
@@ -605,6 +636,19 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// The blocking convenience wrapper. In a browser, drive [`Self::step`] yourself.
     pub fn fit_with<F: FnMut(Progress)>(&mut self, mut on_progress: F) -> Result<()> {
         while let Some(p) = self.step()? {
+            on_progress(p);
+        }
+        Ok(())
+    }
+
+    /// [`Self::fit_with`], awaiting the device instead of blocking on it.
+    ///
+    /// Still a convenience wrapper, and still one long await: it does not yield
+    /// to the browser between steps, so a page that wants to stay responsive
+    /// should drive [`Self::step_async`] itself and hand control back in
+    /// between.
+    pub async fn fit_with_async<F: FnMut(Progress)>(&mut self, mut on_progress: F) -> Result<()> {
+        while let Some(p) = self.step_async().await? {
             on_progress(p);
         }
         Ok(())
@@ -651,11 +695,6 @@ impl<B: AutodiffBackend> Trainer<B> {
         let tokenizer_json = self.tokenizer_json.clone();
         Bundle::pack(&self.into_model(), &manifest, &tokenizer_json)
     }
-}
-
-/// Read a scalar loss back to the host.
-fn scalar<B: AutodiffBackend>(loss: &Tensor<B, 1>) -> f32 {
-    loss.clone().into_scalar().to_f32()
 }
 
 fn div_ceil(a: usize, b: usize) -> usize {
