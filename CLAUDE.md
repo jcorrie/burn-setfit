@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-151 tests, about two seconds, no network. Stay in this loop. Anything touching
+156 tests, about two seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -107,6 +107,21 @@ test names are given so a failure is self-explaining.
   be built from `erf`. Do not swap Burn's `TransformerEncoder` or `Gelu` back in.
   Guard: `minilm::encoder::tests::gelu_gradient_is_exact_and_finite_where_tanh_was_not`.
 
+- **Comparing two `toy_bundle`s compares two random models.** `toy_checkpoint()`
+  initialises randomly, so anything that trains twice is measuring
+  initialisation noise. This bit once already: keying the bundle cache on
+  quantization mode trained a separate model per precision and made f16 look
+  like it was corrupting weights (0.08 drift instead of 2.8e-5). Hence
+  `toy_bundle_quantized` *repacks* one model rather than retraining it. One
+  model in, only the storage differs.
+  Guard: `tests/quantize.rs::f16_barely_moves_the_scores_and_int8_moves_them_more`.
+
+- **Quantization is storage, never compute.** `src/quantize.rs` narrows what is
+  written to the file; `Bundle::load_module` expands it back to `f32` before
+  Burn sees a byte. burn-store *preserves the stored dtype on load*, so handing
+  it f16 would silently build an f16 module rather than the f32 one every other
+  path assumes. Do not "optimise" the expand step away.
+
 - **Seeded runs reproduce weights, not bytes.** Burn writes the safetensors
   `__metadata__` map in `HashMap` order. Compare tensors, never file hashes.
 
@@ -162,6 +177,11 @@ reproduce the published `all-MiniLM-L6-v2` similarity matrix to four decimals:
 ```bash
 cargo test --release --features ndarray,train,native -- --ignored
 ```
+
+Both this and `examples/quantize.rs` need `huggingface.co`, which some sandboxes
+block outright. `cargo run --release --example quantize -- --sizes` is the
+offline half: bundle size depends only on tensor shapes, so it reports exact
+MiniLM-L6 figures from random weights.
 
 `examples/reference.rs` is an independent BERT forward pass written from the raw
 safetensors, for bisecting a disagreement between Burn and the checkpoint. Note
