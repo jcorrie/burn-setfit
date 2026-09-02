@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-153 tests, about two seconds, no network. Stay in this loop. Anything touching
+163 tests, about two seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -149,6 +149,12 @@ test names are given so a failure is self-explaining.
 - Comments explain *why*, especially where the code looks odd on purpose. Several
   are load-bearing — the ones above exist because the alternative was silent
   wrongness.
+- The background class is decode-time too. It is trained like any other label;
+  `ClassifierConfig::background` only changes how the scores are read — never
+  predicted, and the bar every other label must clear. That is what lets a
+  single-label softmax abstain. `decode` stays background-free so its doctests
+  and every existing caller keep meaning what they did;
+  `decode_against_background` is the one that knows.
 - Reduction, hierarchy and threshold are decode-time choices. Adding a knob that
   needs retraining when it could be a `with_*` on `Classifier` is a regression.
 

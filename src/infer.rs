@@ -36,6 +36,27 @@ pub struct Evidence {
     pub score: f32,
 }
 
+/// One chunk's verdict, before anything is reduced.
+///
+/// [`Classifier::classify`] answers "what is this document about", which needs a
+/// [`Reducer`] to collapse many chunks into one answer — and over a long
+/// document that collapse is lossy in ways
+/// [#4](https://github.com/jcorrie/burn-setfit/issues/4) measures. This is the
+/// same work with the collapse left out: one row per passage, scored
+/// independently, for a caller who would rather aggregate it themselves or show
+/// it as-is.
+#[derive(Debug, Clone)]
+pub struct ChunkPrediction {
+    /// Where this chunk sits in the source document.
+    pub byte_range: Range<usize>,
+    /// Content tokens, excluding specials — this chunk's weight in a reduction.
+    pub token_count: usize,
+    /// Per-label probabilities for this chunk alone.
+    pub scores: Vec<f32>,
+    /// What this chunk on its own decodes to, background class included.
+    pub predicted: Vec<usize>,
+}
+
 /// The outcome of classifying one document.
 ///
 /// ```no_run
@@ -314,7 +335,7 @@ impl<B: Backend> Classifier<B> {
 
         let logits = accumulator.finish();
         let scores = to_probabilities(&logits, self.cfg().task);
-        let predicted = decode(&scores, self.cfg().task);
+        let predicted = decode_against_background(&scores, self.cfg().task, self.cfg().background);
 
         // Keep only the evidence for labels the document actually got.
         let mut evidence: Vec<Evidence> = predicted
@@ -332,13 +353,94 @@ impl<B: Backend> Classifier<B> {
         })
     }
 
-    /// Encode one batch of chunks and fold their scores in.
-    async fn run_batch(
+    /// Classify each passage on its own, without reducing to a document verdict.
+    ///
+    /// The reducer is the lossy step over a long document, and
+    /// [#4](https://github.com/jcorrie/burn-setfit/issues/4) is largely about
+    /// how lossy. This hands back what the model actually saw — one row per
+    /// chunk, with the byte range it came from — and leaves the aggregating to
+    /// the caller. Useful for showing *where* in a document a label came from,
+    /// and for choosing a reduction after the fact rather than before.
+    ///
+    /// Memory is proportional to the number of chunks, unlike
+    /// [`Self::classify_stream`], which folds as it goes and stays constant. A
+    /// genuinely unbounded input wants that one.
+    ///
+    /// ```no_run
+    /// # use burn::backend::NdArray;
+    /// # use burn_setfit::Classifier;
+    /// # fn main() -> burn_setfit::Result<()> {
+    /// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+    /// # let document = "";
+    /// for chunk in classifier.classify_chunks(document)? {
+    ///     let labels = classifier.labels();
+    ///     for label in &chunk.predicted {
+    ///         println!("{:?}: {}", chunk.byte_range, labels[*label]);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn classify_chunks(&self, text: &str) -> Result<Vec<ChunkPrediction>> {
+        blocking(
+            "classifying a document by chunk",
+            self.classify_chunks_async(text),
+        )
+    }
+
+    /// [`Self::classify_chunks`], awaiting the device instead of blocking on it.
+    pub async fn classify_chunks_async(&self, text: &str) -> Result<Vec<ChunkPrediction>> {
+        let chunker = Chunker::new(
+            core::iter::once(text.to_string()),
+            &self.tokenizer,
+            self.cfg().chunk,
+        );
+
+        let mut out = Vec::new();
+        let mut batch: Vec<Chunk> = Vec::with_capacity(self.batch_size);
+
+        for chunk in chunker {
+            batch.push(chunk?);
+            if batch.len() == self.batch_size {
+                self.push_chunk_predictions(&batch, &mut out).await?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.push_chunk_predictions(&batch, &mut out).await?;
+        }
+
+        Ok(out)
+    }
+
+    /// Score one batch and append a row per chunk.
+    async fn push_chunk_predictions(
         &self,
         batch: &[Chunk],
-        accumulator: &mut DocAccumulator,
-        evidence: &mut [Vec<Evidence>],
+        out: &mut Vec<ChunkPrediction>,
     ) -> Result<()> {
+        let rows = self.forward_rows(batch).await?;
+        for (chunk, row) in batch.iter().zip(&rows) {
+            let scores = to_probabilities(row, self.cfg().task);
+            // Decoded per chunk with the same rules the document gets, so a
+            // caller comparing the two is comparing like with like.
+            let predicted =
+                decode_against_background(&scores, self.cfg().task, self.cfg().background);
+            out.push(ChunkPrediction {
+                byte_range: chunk.byte_range.clone(),
+                token_count: chunk.token_count,
+                scores,
+                predicted,
+            });
+        }
+        Ok(())
+    }
+
+    /// Encode one batch of chunks and read their logits back, one row each.
+    ///
+    /// The whole device-touching part of inference, shared by the reducing path
+    /// and the per-chunk one so they cannot disagree about what a chunk scores.
+    async fn forward_rows(&self, batch: &[Chunk]) -> Result<Vec<Vec<f32>>> {
         let sequences: Vec<Vec<u32>> = batch.iter().map(|c| c.ids.clone()).collect();
         let (input_ids, attention_mask) = pad_batch::<B>(
             &sequences,
@@ -350,12 +452,21 @@ impl<B: Backend> Classifier<B> {
         let data = readback::floats(logits).await?;
 
         let num_labels = self.cfg().num_labels();
-        for (i, chunk) in batch.iter().enumerate() {
-            let row = &data[i * num_labels..(i + 1) * num_labels];
+        Ok(data.chunks(num_labels).map(<[f32]>::to_vec).collect())
+    }
+
+    /// Encode one batch of chunks and fold their scores in.
+    async fn run_batch(
+        &self,
+        batch: &[Chunk],
+        accumulator: &mut DocAccumulator,
+        evidence: &mut [Vec<Evidence>],
+    ) -> Result<()> {
+        let rows = self.forward_rows(batch).await?;
+        for (chunk, row) in batch.iter().zip(&rows) {
             accumulator.push(chunk.token_count as f32, row);
             self.record_evidence(chunk, row, evidence);
         }
-
         Ok(())
     }
 
@@ -482,6 +593,67 @@ pub fn to_probabilities(logits: &[f32], task: TaskMode) -> Vec<f32> {
 /// assert_eq!(decode(&scores, TaskMode::MultiLabel { threshold: 0.9 }), Vec::<usize>::new());
 /// ```
 pub fn decode(scores: &[f32], task: TaskMode) -> Vec<usize> {
+    decode_against_background(scores, task, None)
+}
+
+/// [`decode`], with one label acting as "none of the above".
+///
+/// The background class is never predicted. What it does instead is set the bar:
+/// a label counts only if it is stronger than "nothing in particular".
+///
+/// - **Multi-label** — a label must clear the threshold *and* outscore the
+///   background. The second test is the one that matters over long documents,
+///   where scores compress toward the middle and a fixed threshold stops
+///   discriminating long before the ordering does.
+/// - **Single-label** — the argmax still wins, but if it *is* the background
+///   class the document predicts nothing. That is how a softmax abstains: not by
+///   scoring low, which it cannot do, but by having somewhere to put the mass.
+///
+/// ```
+/// use burn_setfit::TaskMode;
+/// use burn_setfit::infer::decode_against_background;
+///
+/// // Index 2 is "other". Multi-label: `a` beats it, `b` does not.
+/// let scores = [0.61, 0.30, 0.45];
+/// let multi = TaskMode::MultiLabel { threshold: 0.4 };
+/// assert_eq!(decode_against_background(&scores, multi, Some(2)), vec![0]);
+///
+/// // Without a background class, `b` clears 0.4 and is predicted too.
+/// assert_eq!(decode_against_background(&scores, multi, None), vec![0, 2]);
+///
+/// // Single-label abstains when the background class wins outright.
+/// let filler = [0.20, 0.15, 0.65];
+/// let single = TaskMode::SingleLabel;
+/// assert!(decode_against_background(&filler, single, Some(2)).is_empty());
+/// assert_eq!(decode_against_background(&filler, single, None), vec![2]);
+/// ```
+pub fn decode_against_background(
+    scores: &[f32],
+    task: TaskMode,
+    background: Option<usize>,
+) -> Vec<usize> {
+    let Some(background) = background else {
+        return decode_plain(scores, task);
+    };
+    let floor = scores.get(background).copied().unwrap_or(f32::NEG_INFINITY);
+
+    match task {
+        // The argmax is unchanged; what changes is that landing on the
+        // background class now means "none", not "this document is filler".
+        TaskMode::SingleLabel => match decode_plain(scores, task).first() {
+            Some(&winner) if winner != background => vec![winner],
+            _ => Vec::new(),
+        },
+        TaskMode::MultiLabel { threshold } => scores
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != background && **s >= threshold && **s > floor)
+            .map(|(i, _)| i)
+            .collect(),
+    }
+}
+
+fn decode_plain(scores: &[f32], task: TaskMode) -> Vec<usize> {
     match task {
         TaskMode::SingleLabel => scores
             .iter()

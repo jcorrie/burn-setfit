@@ -198,11 +198,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bg = train(
         &checkpoint,
         ClassifierConfig::new(["billing", "outage", "feature", "other"]).multi_label(),
-        bg_examples,
+        bg_examples.clone(),
     )?;
     evaluate(
         "MULTI-LABEL + background class, MaxLogits",
         &bg,
+        Reducer::MaxLogits,
+        None,
+        &signal_doc,
+        &control_doc,
+    )?;
+
+    // The same model and the same scores, decoded differently. Above, "other"
+    // is a label like any other and the verdict is still "is billing above
+    // 0.5?" — which the row above answers badly, because that configuration
+    // separates well and calibrates poorly. Naming it the background class
+    // changes the question to "is billing above other?", which is what the
+    // separation actually measures.
+    let bg_declared = train(
+        &checkpoint,
+        ClassifierConfig::new(["billing", "outage", "feature", "other"])
+            .multi_label()
+            .with_background_class("other")?,
+        bg_examples,
+    )?;
+    evaluate(
+        "MULTI-LABEL + background class DECODED AS ONE, MaxLogits",
+        &bg_declared,
         Reducer::MaxLogits,
         None,
         &signal_doc,
