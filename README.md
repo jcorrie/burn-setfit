@@ -29,7 +29,7 @@ verified, and what is not, matters more than a version number here:
 | **Run on software Vulkan only** | `wgpu` — the suite passes on Mesa's lavapipe (`llvmpipe`, `device_type: Cpu`), which exercises the whole backend but is not hardware ([#5]). |
 | **Compiles, never run** | `wgpu` on `wasm32`, i.e. WebGPU in a browser. Needs an explicit opt-in — see [Features](#features). |
 | **Reported, not reproduced here** | The real model in a real browser: the maintainer runs this client-side in an Excel add-in on `NdArray` ([#1]). The repository's own harness still only drives a 146 KB stand-in. |
-| **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). |
+| **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). A background class and per-chunk output now address the decode half; the table has not been re-measured. |
 
 Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
 [#1] and [#2] are the two that matter.
@@ -185,6 +185,7 @@ cargo test --doc --features ndarray,train,native
 | `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
 | `tests/async_api.rs` | That the `_async` methods and their blocking wrappers agree exactly |
 | `tests/quantize.rs` | That every precision round-trips, shrinks, and stays close to fp32 |
+| `tests/background.rs` | The background-class decision rule, and per-chunk output |
 | `tests/wgpu.rs` | The `wgpu` backend against `ndarray` (needs the feature) |
 | `tests/wgpu.rs` | That the `wgpu` backend runs at all, and agrees with `ndarray` (needs `--features wgpu`) |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
@@ -263,11 +264,52 @@ hierarchically does not rescue it — saturation happens inside the first block.
 This measurement is why `Reducer::default_for(MultiLabel)` is `MaxLogits`.
 
 **If you classify long documents, use multi-label with `MaxLogits`, and train a
-background class** ([#4] tracks making this less manual) on text representative of
-your filler. That is the only configuration above that both separates signal from
-noise and correctly rejects the control — though note it is *under-confident*: the
-signal document scores 0.389 and so predicts `other` at the default 0.5 threshold.
-It separates well and calibrates badly.
+background class** on text representative of your filler. That is the only
+configuration above that both separates signal from noise and correctly rejects
+the control — though note it is *under-confident*: the signal document scores
+0.389 and so predicts `other` at the default 0.5 threshold. It separates well and
+calibrates badly.
+
+### Decoding against a background class
+
+That last sentence is a decode problem, not a training one, so it has a
+decode-time answer. Naming the background class changes the question from "is
+billing above 0.5?" — which the numbers above answer badly — to "is billing
+above *other*?", which is what the separation actually measures:
+
+```rust
+let config = ClassifierConfig::new(["billing", "outage", "feature", "other"])
+    .multi_label()
+    .with_background_class("other")?;
+```
+
+The class is still trained like any other; what changes is that it stops being
+something the model can predict and becomes the bar every other label clears. It
+also gives a single-label head somewhere to abstain *to*: a softmax over real
+classes cannot say "none", but one whose argmax lands on the background class
+can, and then predicts nothing.
+
+`tests/background.rs` pins the decision rule, which is exact arithmetic. Whether
+it *classifies* long documents better is a separate question that needs the real
+checkpoint — `examples/long_document.rs` has the row, and the table above has
+not been re-measured with it. [#4] stays open for that, and for threshold
+calibration.
+
+### Per-chunk output
+
+The reducer is the lossy step, and sometimes the right move is not to reduce:
+
+```rust
+for chunk in classifier.classify_chunks(document)? {
+    println!("{:?} -> {:?}", chunk.byte_range, chunk.predicted);
+}
+```
+
+One row per passage — byte range, token count, per-label scores and its own
+verdict — leaving the aggregating to the caller. Both paths share one forward
+pass, so a chunk scores the same either way. Note this holds every row in
+memory, unlike `classify_stream`, which folds as it goes; a genuinely unbounded
+input wants that one.
 
 ## WebAssembly
 

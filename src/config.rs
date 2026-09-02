@@ -57,6 +57,13 @@ pub struct ClassifierConfig {
     pub reducer: Reducer,
     /// Reduce chunks in blocks of this size, recursively, rather than all at once.
     pub hierarchy_fanout: Option<usize>,
+    /// The label meaning "none of the above", if there is one.
+    ///
+    /// An index into [`Self::labels`], because the background class is trained
+    /// exactly like every other class — what changes is how it is *decoded*.
+    /// See [`Self::with_background_class`].
+    #[serde(default)]
+    pub background: Option<usize>,
 }
 
 impl ClassifierConfig {
@@ -73,6 +80,7 @@ impl ClassifierConfig {
             chunk: ChunkConfig::default(),
             reducer: Reducer::default_for(task),
             hierarchy_fanout: None,
+            background: None,
         }
     }
 
@@ -131,6 +139,65 @@ impl ClassifierConfig {
         self
     }
 
+    /// Name one of the labels as "none of the above".
+    ///
+    /// The class is trained like any other — it has to be, since something must
+    /// teach the model what filler looks like — but it stops being a class the
+    /// model can *predict*. Instead it becomes the bar every other label has to
+    /// clear.
+    ///
+    /// This is aimed at the failure measured in
+    /// [#4](https://github.com/jcorrie/burn-setfit/issues/4): over a long
+    /// document, a configuration can separate signal from filler well and still
+    /// decide wrongly, because the absolute scores sit on the wrong side of a
+    /// fixed threshold. Comparing against a background class asks the question
+    /// the separation actually answers — "is this label stronger than nothing in
+    /// particular?" — instead of "is this label above 0.5?".
+    ///
+    /// It also gives a single-label head somewhere to abstain *to*. A softmax
+    /// over real classes cannot say "none"; a softmax whose argmax lands on the
+    /// background class can.
+    ///
+    /// ```
+    /// use burn_setfit::ClassifierConfig;
+    ///
+    /// let config = ClassifierConfig::new(["billing", "outage", "other"])
+    ///     .multi_label()
+    ///     .with_background_class("other")
+    ///     .expect("`other` is one of the labels");
+    ///
+    /// assert_eq!(config.background, Some(2));
+    /// ```
+    ///
+    /// Naming a label that does not exist is an error rather than a silent
+    /// no-op, because the mistake is invisible at every later point:
+    ///
+    /// ```
+    /// use burn_setfit::ClassifierConfig;
+    ///
+    /// let err = ClassifierConfig::new(["billing", "outage"])
+    ///     .with_background_class("other")
+    ///     .expect_err("there is no `other` to be the background");
+    /// assert!(format!("{err}").contains("other"));
+    /// ```
+    pub fn with_background_class(mut self, name: &str) -> Result<Self> {
+        match self.label_index(name) {
+            Some(i) => {
+                self.background = Some(i);
+                Ok(self)
+            }
+            None => Err(SetFitError::Config(format!(
+                "no label named {name:?} to use as the background class; labels are {:?}",
+                self.labels
+            ))),
+        }
+    }
+
+    /// The background label's name, if one is set.
+    pub fn background_label(&self) -> Option<&str> {
+        self.background.map(|i| self.labels[i].as_str())
+    }
+
     /// Number of classes.
     pub fn num_labels(&self) -> usize {
         self.labels.len()
@@ -183,6 +250,24 @@ impl ClassifierConfig {
         self.task.validate()?;
         self.chunk.validate()?;
         self.reducer.validate()?;
+
+        if let Some(background) = self.background {
+            if background >= self.labels.len() {
+                return Err(SetFitError::Config(format!(
+                    "background class is label {background}, but there are only {} labels",
+                    self.labels.len()
+                )));
+            }
+            // With one real class left, "stronger than background" is the whole
+            // decision and the classifier has nothing to choose between.
+            if self.labels.len() < 3 {
+                return Err(SetFitError::Config(format!(
+                    "a background class needs at least two other labels to sit against,                      but {:?} leaves only {}",
+                    self.labels,
+                    self.labels.len() - 1
+                )));
+            }
+        }
 
         if let Some(fanout) = self.hierarchy_fanout
             && fanout < 2
