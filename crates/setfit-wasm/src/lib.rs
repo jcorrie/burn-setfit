@@ -23,27 +23,34 @@
 //!
 //! Not a default anyone settled for: a GPU backend cannot be driven through the
 //! synchronous methods used below. WebGPU has no blocking readback, so on
-//! `wasm32` those return `SetFitError::Readback`, and lazy `WgpuDevice`
+//! `wasm32` those return `SetFitError::Readback`, and lazy wgpu device
 //! acquisition traps earlier still, while the first tensor is being built.
 //!
 //! `burn-setfit` grew an `_async` twin for every method that reads a tensor, so
 //! the library side of that is solved. Reaching it from here is a separate
 //! piece of work: the constructors and `step` would have to become
 //! `Promise`-returning through `wasm-bindgen-futures`, and something would need
-//! to call `burn::backend::wgpu::init_setup_async` before the first tensor
+//! to call `Device::wgpu_options().init_async()` before the first tensor
 //! exists. Until that is written *and run against a real GPU*, this binding
 //! stays on the backend that is actually tested. See
 //! [#5](https://github.com/jcorrie/burn-setfit/issues/5).
-
-use burn::backend::{Autodiff, NdArray};
+use burn::tensor::Device;
 use burn_setfit::{
     Checkpoint, Classifier as CoreClassifier, ClassifierConfig, Example, MiniLmVariant,
     TrainConfig, Trainer as CoreTrainer,
 };
 use wasm_bindgen::prelude::*;
 
-type B = NdArray<f32>;
-type AB = Autodiff<B>;
+/// The device for [`ACTIVE_BACKEND`], named rather than defaulted.
+///
+/// Burn picks a backend at run time; `Device::default()` would follow whatever
+/// features happen to be unified into the build, which is how a "CPU" binding
+/// ends up on a GPU it cannot drive synchronously. Upstream deprecates `ndarray`
+/// in favour of `flex`, but `ndarray` is the backend this binding is tested on.
+#[allow(deprecated)]
+fn device() -> Device {
+    Device::ndarray()
+}
 
 /// Install a panic hook that reports Rust panics to the browser console.
 ///
@@ -74,7 +81,7 @@ const UNIMPLEMENTED_BACKENDS: &[(&str, &str)] = &[
          these bindings are synchronous. `burn-setfit` has an `_async` method \
          behind every readback, so the library side is ready; reaching it from \
          here needs Promise-returning constructors via wasm-bindgen-futures and \
-         a call to `burn::backend::wgpu::init_setup_async` before the first \
+         a call to `Device::wgpu_options().init_async()` before the first \
          tensor exists. That is unwritten, and has never been run on a GPU",
     ),
     (
@@ -158,7 +165,7 @@ struct JsEvidence {
 /// A loaded model.
 #[wasm_bindgen]
 pub struct Classifier {
-    inner: CoreClassifier<B>,
+    inner: CoreClassifier,
 }
 
 #[wasm_bindgen]
@@ -172,7 +179,7 @@ impl Classifier {
     pub fn new(bundle: &[u8], backend: Option<String>) -> Result<Classifier, JsValue> {
         require_backend(backend)?;
         Ok(Classifier {
-            inner: CoreClassifier::from_bundle(bundle, Default::default()).map_err(js_err)?,
+            inner: CoreClassifier::from_bundle(bundle, device()).map_err(js_err)?,
         })
     }
 
@@ -257,7 +264,7 @@ struct JsProgress {
 /// Few-shot training, one step per call.
 #[wasm_bindgen]
 pub struct Trainer {
-    inner: Option<CoreTrainer<AB>>,
+    inner: Option<CoreTrainer>,
 }
 
 #[wasm_bindgen]
@@ -310,14 +317,8 @@ impl Trainer {
             })
             .collect();
 
-        let inner = CoreTrainer::new(
-            &checkpoint,
-            classifier,
-            examples,
-            config,
-            Default::default(),
-        )
-        .map_err(js_err)?;
+        let inner = CoreTrainer::new(&checkpoint, classifier, examples, config, device())
+            .map_err(js_err)?;
 
         Ok(Trainer { inner: Some(inner) })
     }

@@ -9,20 +9,15 @@
 //! code path that drifted.
 
 mod common;
-
-use burn::backend::{Autodiff, NdArray};
 use burn::tensor::try_read_sync;
 use burn_setfit::checkpoint::Checkpoint;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::infer::Classifier;
 use burn_setfit::train::{Progress, Trainer};
 use common::{
-    fast_train_config, separable_examples, small_chunking, toy_bundle, toy_checkpoint, words,
+    cpu, fast_train_config, separable_examples, small_chunking, toy_bundle, toy_checkpoint, words,
 };
 use core::future::Future;
-
-type B = NdArray<f32>;
-type Ad = Autodiff<NdArray<f32>>;
 
 /// Run a future to completion on this thread.
 ///
@@ -33,9 +28,9 @@ fn block_on<T>(f: impl Future<Output = T>) -> T {
     try_read_sync(f).expect("a native future runs to completion without yielding")
 }
 
-fn single_label() -> Classifier<B> {
+fn single_label() -> Classifier {
     let config = ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking());
-    Classifier::<B>::from_bundle(&toy_bundle(config), Default::default()).expect("loads")
+    Classifier::from_bundle(&toy_bundle(config), cpu()).expect("loads")
 }
 
 // ── inference ───────────────────────────────────────────────────────────────
@@ -93,13 +88,13 @@ fn embed_async_returns_nothing_for_an_empty_batch() {
 
 // ── training ────────────────────────────────────────────────────────────────
 
-fn trainer(checkpoint: &Checkpoint) -> Trainer<Ad> {
-    Trainer::<Ad>::new(
+fn trainer(checkpoint: &Checkpoint) -> Trainer {
+    Trainer::new(
         checkpoint,
         ClassifierConfig::new(["alpha", "beta"]),
         separable_examples(),
         fast_train_config(),
-        Default::default(),
+        cpu(),
     )
     .expect("toy training data is well formed")
 }

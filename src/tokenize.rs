@@ -6,8 +6,7 @@
 //! keeping us off the parallel code paths that do not survive the browser.
 
 use crate::error::{Result, SetFitError};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Device, Int, Tensor};
 
 /// The special token ids a BERT-family tokenizer needs to build model input.
 #[derive(Debug, Clone, Copy)]
@@ -121,11 +120,11 @@ impl Tokenizer {
 ///
 /// Both tensors are `[batch_size, max_len]`; the mask is 1.0 for real tokens and
 /// 0.0 for padding, matching what the encoder's pad-mask conversion expects.
-pub fn pad_batch<B: Backend>(
+pub fn pad_batch(
     sequences: &[Vec<u32>],
     pad_id: u32,
-    device: &B::Device,
-) -> (Tensor<B, 2, Int>, Tensor<B, 2>) {
+    device: &Device,
+) -> (Tensor<2, Int>, Tensor<2>) {
     let batch_size = sequences.len();
     let max_len = sequences.iter().map(|s| s.len()).max().unwrap_or(0);
 
@@ -140,9 +139,9 @@ pub fn pad_batch<B: Backend>(
     }
 
     let input_ids =
-        Tensor::<B, 1, Int>::from_data(ids.as_slice(), device).reshape([batch_size, max_len]);
+        Tensor::<1, Int>::from_data(ids.as_slice(), device).reshape([batch_size, max_len]);
     let attention_mask =
-        Tensor::<B, 1>::from_data(mask.as_slice(), device).reshape([batch_size, max_len]);
+        Tensor::<1>::from_data(mask.as_slice(), device).reshape([batch_size, max_len]);
 
     (input_ids, attention_mask)
 }

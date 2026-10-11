@@ -6,17 +6,12 @@
 //! as one with it, the classifier is reporting the filler, not the signal.
 //!
 //! Run with: `cargo run --release --example long_document`
-
-use burn::backend::{Autodiff, NdArray};
 use burn_setfit::checkpoint::Checkpoint;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::infer::Classifier;
 use burn_setfit::minilm::MiniLmVariant;
 use burn_setfit::reduce::Reducer;
 use burn_setfit::train::{Example, TrainConfig, Trainer};
-
-type B = NdArray<f32>;
-type AB = Autodiff<B>;
 
 const FILLER: &str = "The quarterly review covered headcount, office moves, and the \
                       updated travel policy. Attendance was steady and the agenda ran \
@@ -71,7 +66,7 @@ fn train(
     classifier: ClassifierConfig,
     examples: Vec<Example>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut trainer = Trainer::<AB>::new(
+    let mut trainer = Trainer::new(
         checkpoint,
         classifier,
         examples,
@@ -95,8 +90,7 @@ fn evaluate(
     signal_doc: &str,
     control_doc: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut classifier =
-        Classifier::<B>::from_bundle(bundle, Default::default())?.with_reducer(reducer);
+    let mut classifier = Classifier::from_bundle(bundle, Default::default())?.with_reducer(reducer);
     if let Some(f) = fanout {
         classifier = classifier.with_hierarchy(f);
     }

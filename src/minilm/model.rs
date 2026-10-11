@@ -6,8 +6,7 @@ use burn::nn::Initializer::KaimingUniform;
 use burn::nn::transformer::{
     TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput,
 };
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Int, Tensor};
+use burn::tensor::{Bool, Device, Int, Tensor};
 
 /// MiniLM model configuration.
 ///
@@ -38,23 +37,23 @@ pub struct MiniLmConfig {
 ///
 /// A BERT-based encoder optimized for sentence embeddings.
 #[derive(Module, Debug)]
-pub struct MiniLmModel<B: Backend> {
+pub struct MiniLmModel {
     /// Token embeddings (word + position + token_type).
-    pub embeddings: MiniLmEmbeddings<B>,
+    pub embeddings: MiniLmEmbeddings,
     /// Transformer encoder stack.
-    pub encoder: TransformerEncoder<B>,
+    pub encoder: TransformerEncoder,
 }
 
 /// Output from the MiniLM model.
 #[derive(Debug, Clone)]
-pub struct MiniLmOutput<B: Backend> {
+pub struct MiniLmOutput {
     /// Hidden states from the last encoder layer [batch_size, seq_len, hidden_size].
-    pub hidden_states: Tensor<B, 3>,
+    pub hidden_states: Tensor<3>,
 }
 
 impl MiniLmConfig {
     /// Initialize model with default (random) weights.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> MiniLmModel<B> {
+    pub fn init(&self, device: &Device) -> MiniLmModel {
         let embeddings = self.embeddings_config().init(device);
         let encoder = self.encoder_config().init(device);
 
@@ -101,7 +100,7 @@ impl MiniLmConfig {
     }
 }
 
-impl<B: Backend> MiniLmModel<B> {
+impl MiniLmModel {
     /// Width of the sentence embeddings this body produces.
     ///
     /// Read from the weights rather than assumed, so a head can be sized to any
@@ -121,10 +120,10 @@ impl<B: Backend> MiniLmModel<B> {
     /// Hidden states from the last encoder layer.
     pub fn forward(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Tensor<B, 2>,
-        token_type_ids: Option<Tensor<B, 2, Int>>,
-    ) -> MiniLmOutput<B> {
+        input_ids: Tensor<2, Int>,
+        attention_mask: Tensor<2>,
+        token_type_ids: Option<Tensor<2, Int>>,
+    ) -> MiniLmOutput {
         // Get embeddings
         let embeddings = self.embeddings.forward(input_ids, token_type_ids);
 
@@ -132,8 +131,8 @@ impl<B: Backend> MiniLmModel<B> {
         // attention_mask: 1 = real, 0 = padding
         // mask_pad: true = padding, false = real
         let device = attention_mask.device();
-        let zeros = Tensor::<B, 2>::zeros(attention_mask.shape(), &device);
-        let mask_pad: Tensor<B, 2, Bool> = attention_mask.equal(zeros);
+        let zeros = Tensor::<2>::zeros(attention_mask.shape(), &device);
+        let mask_pad: Tensor<2, Bool> = attention_mask.equal(zeros);
 
         // Forward through encoder
         let encoder_input = TransformerEncoderInput::new(embeddings).mask_pad(mask_pad);

@@ -30,7 +30,7 @@ use crate::head::TaskMode;
 use crate::minilm::{MiniLmConfig, MiniLmVariant, check_sequence_budget};
 use crate::model::SetFitModule;
 use crate::tokenize::Tokenizer;
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 use burn_store::{ModuleSnapshot, SafetensorsStore};
 
 const MAGIC: &[u8; 8] = b"BSETFIT\x00";
@@ -44,10 +44,9 @@ pub const FORMAT_VERSION: u32 = 1;
 /// checkpoint it was built on and are filled in from that checkpoint.
 ///
 /// ```no_run
-/// # use burn::backend::NdArray;
 /// # use burn_setfit::Classifier;
 /// # fn main() -> burn_setfit::Result<()> {
-/// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+/// # let classifier = Classifier::from_bundle(&[], Default::default())?;
 /// let manifest = classifier.manifest();
 ///
 /// println!("{:?} over {:?}", manifest.task(), manifest.labels());
@@ -123,7 +122,7 @@ impl Manifest {
 /// separately, so nothing else stops a three-label manifest shipping with a
 /// four-label head. That mismatch would not fail loudly — it would silently
 /// misattribute every score to the wrong class name.
-fn check_against_module<B: Backend>(manifest: &Manifest, module: &SetFitModule<B>) -> Result<()> {
+fn check_against_module(manifest: &Manifest, module: &SetFitModule) -> Result<()> {
     let head_labels = module.head.num_labels();
     if head_labels != manifest.num_labels() {
         return Err(SetFitError::Config(format!(
@@ -204,8 +203,8 @@ fn read_blob(bytes: &[u8], at: usize, len: usize, what: &str) -> Result<Vec<u8>>
 
 impl Bundle {
     /// Serialise a trained model into the container format.
-    pub fn pack<B: Backend>(
-        module: &SetFitModule<B>,
+    pub fn pack(
+        module: &SetFitModule,
         manifest: &Manifest,
         tokenizer_json: &[u8],
     ) -> Result<Vec<u8>> {
@@ -281,9 +280,9 @@ impl Bundle {
     }
 
     /// Materialise the module onto a device.
-    pub fn load_module<B: Backend>(&self, device: &B::Device) -> Result<SetFitModule<B>> {
+    pub fn load_module(&self, device: &Device) -> Result<SetFitModule> {
         let mut module =
-            SetFitModule::<B>::init(&self.manifest.body, self.manifest.num_labels(), device);
+            SetFitModule::init(&self.manifest.body, self.manifest.num_labels(), device);
         let mut store = SafetensorsStore::from_bytes(Some(self.weights.clone()));
         module
             .load_from(&mut store)

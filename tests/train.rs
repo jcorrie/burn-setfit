@@ -1,18 +1,13 @@
 //! End-to-end: train from scratch, classify, round-trip through a bundle.
 
 mod common;
-
-use burn::backend::{Autodiff, NdArray};
 use burn_setfit::bundle::Bundle;
 use burn_setfit::chunk::ChunkConfig;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::infer::Classifier;
 use burn_setfit::train::Stage;
 use burn_setfit::train::{Example, TrainConfig, Trainer};
-use common::{separable_examples as shared_separable, small_chunking, toy_checkpoint};
-
-type B = NdArray<f32>;
-type AB = Autodiff<B>;
+use common::{cpu, separable_examples as shared_separable, small_chunking, toy_checkpoint};
 
 fn fast_config() -> TrainConfig {
     TrainConfig {
@@ -44,10 +39,10 @@ fn single_label_config() -> ClassifierConfig {
 
 #[test]
 fn trains_end_to_end_and_separates_the_classes() {
-    let device = Default::default();
+    let device = cpu();
     let examples = separable_examples();
 
-    let mut trainer = Trainer::<AB>::new(
+    let mut trainer = Trainer::new(
         &toy_checkpoint(),
         single_label_config(),
         examples.clone(),
@@ -96,11 +91,9 @@ fn trains_end_to_end_and_separates_the_classes() {
     assert!(last < first, "head loss should decrease: {first} -> {last}");
 
     // And the trained model should actually classify its own training data.
-    let classifier = Classifier::<B>::from_bundle(
-        &trainer.finish().expect("a completed run packs"),
-        Default::default(),
-    )
-    .expect("bundle loads");
+    let classifier =
+        Classifier::from_bundle(&trainer.finish().expect("a completed run packs"), cpu())
+            .expect("bundle loads");
 
     let correct = examples
         .iter()
@@ -116,7 +109,7 @@ fn trains_end_to_end_and_separates_the_classes() {
 
 #[test]
 fn multi_label_can_predict_several_labels_or_none() {
-    let device = Default::default();
+    let device = cpu();
 
     // Label 0 is signalled by `a`, label 1 by `x`. Some examples carry both.
     let examples = vec![
@@ -128,7 +121,7 @@ fn multi_label_can_predict_several_labels_or_none() {
         Example::multi("a x a x", vec![0, 1]),
     ];
 
-    let mut trainer = Trainer::<AB>::new(
+    let mut trainer = Trainer::new(
         &toy_checkpoint(),
         ClassifierConfig::new(["a", "x"])
             .multi_label()
@@ -144,11 +137,9 @@ fn multi_label_can_predict_several_labels_or_none() {
 
     trainer.fit_with(|_| {}).expect("training should complete");
 
-    let classifier = Classifier::<B>::from_bundle(
-        &trainer.finish().expect("a completed run packs"),
-        Default::default(),
-    )
-    .expect("bundle loads");
+    let classifier =
+        Classifier::from_bundle(&trainer.finish().expect("a completed run packs"), cpu())
+            .expect("bundle loads");
 
     let both = classifier.classify("a a x x").expect("classifies");
     assert_eq!(
@@ -166,7 +157,7 @@ fn multi_label_can_predict_several_labels_or_none() {
 
 #[test]
 fn rejects_data_that_cannot_form_pairs() {
-    let device = Default::default();
+    let device = cpu();
 
     // Every example shares the single label, so no negative pair exists.
     let single_class = vec![
@@ -175,7 +166,7 @@ fn rejects_data_that_cannot_form_pairs() {
         Example::single("c a b", 0),
     ];
 
-    let err = Trainer::<AB>::new(
+    let err = Trainer::new(
         &toy_checkpoint(),
         single_label_config(),
         single_class,
@@ -190,9 +181,9 @@ fn rejects_data_that_cannot_form_pairs() {
 
 #[test]
 fn bundle_round_trips_to_identical_predictions() {
-    let device = Default::default();
+    let device = cpu();
 
-    let mut trainer = Trainer::<AB>::new(
+    let mut trainer = Trainer::new(
         &toy_checkpoint(),
         ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking()),
         separable_examples(),
@@ -203,7 +194,7 @@ fn bundle_round_trips_to_identical_predictions() {
     trainer.fit_with(|_| {}).expect("training completes");
 
     let packed = trainer.finish().expect("a completed run packs");
-    let after = Classifier::<B>::from_bundle(&packed, Default::default()).expect("unpacks");
+    let after = Classifier::from_bundle(&packed, cpu()).expect("unpacks");
     assert_eq!(after.labels(), &["alpha".to_string(), "beta".to_string()]);
 
     let expected = after.classify("a b c a b c").expect("classifies");
@@ -234,15 +225,9 @@ fn rejects_a_corrupt_bundle_rather_than_misreading_it() {
 
 #[track_caller]
 fn training_rejects(examples: Vec<Example>, config: ClassifierConfig, mentioning: &str) {
-    let err = Trainer::<AB>::new(
-        &toy_checkpoint(),
-        config,
-        examples,
-        fast_config(),
-        Default::default(),
-    )
-    .err()
-    .expect("expected this training data to be rejected");
+    let err = Trainer::new(&toy_checkpoint(), config, examples, fast_config(), cpu())
+        .err()
+        .expect("expected this training data to be rejected");
     let text = format!("{err}");
     assert!(
         text.to_lowercase().contains(mentioning),
@@ -279,14 +264,14 @@ fn a_multi_label_example_may_carry_no_labels_at_all() {
         .collect();
     examples.push(Example::multi("a x b y", vec![]));
 
-    Trainer::<AB>::new(
+    Trainer::new(
         &toy_checkpoint(),
         ClassifierConfig::new(["a", "b"])
             .multi_label()
             .with_chunking(small_chunking()),
         examples,
         fast_config(),
-        Default::default(),
+        cpu(),
     )
     .expect("an unlabelled multi-label example is allowed");
 }
@@ -311,7 +296,7 @@ fn an_invalid_classifier_config_is_rejected_before_training() {
 
 #[test]
 fn invalid_hyperparameters_are_rejected_before_training() {
-    let err = Trainer::<AB>::new(
+    let err = Trainer::new(
         &toy_checkpoint(),
         single_label_config(),
         shared_separable(),
@@ -319,7 +304,7 @@ fn invalid_hyperparameters_are_rejected_before_training() {
             head_epochs: 0,
             ..fast_config()
         },
-        Default::default(),
+        cpu(),
     )
     .err()
     .expect("zero head epochs trains no head");
@@ -334,7 +319,7 @@ fn a_sequence_budget_beyond_the_bodys_positions_is_rejected_before_training() {
     let checkpoint = toy_checkpoint();
     let positions = checkpoint.config.max_position_embeddings;
 
-    let err = Trainer::<AB>::new(
+    let err = Trainer::new(
         &checkpoint,
         single_label_config(),
         shared_separable(),
@@ -342,7 +327,7 @@ fn a_sequence_budget_beyond_the_bodys_positions_is_rejected_before_training() {
             max_tokens: positions + 1,
             ..fast_config()
         },
-        Default::default(),
+        cpu(),
     )
     .err()
     .expect("a training budget the body cannot encode must be refused");
@@ -360,12 +345,12 @@ fn chunk_windows_beyond_the_bodys_positions_are_rejected_before_training() {
     let checkpoint = toy_checkpoint();
     let positions = checkpoint.config.max_position_embeddings;
 
-    let err = Trainer::<AB>::new(
+    let err = Trainer::new(
         &checkpoint,
         ClassifierConfig::new(["a", "b"]).with_chunking(ChunkConfig::new(positions + 1)),
         shared_separable(),
         fast_config(),
-        Default::default(),
+        cpu(),
     )
     .err()
     .expect("windows the body cannot encode must be refused");
@@ -377,12 +362,12 @@ fn a_checkpoint_without_weights_is_rejected_before_training() {
     let mut broken = toy_checkpoint();
     broken.weights.clear();
     assert!(
-        Trainer::<AB>::new(
+        Trainer::new(
             &broken,
             single_label_config(),
             shared_separable(),
             fast_config(),
-            Default::default(),
+            cpu(),
         )
         .is_err()
     );
@@ -390,13 +375,13 @@ fn a_checkpoint_without_weights_is_rejected_before_training() {
 
 // ── the training state machine ──────────────────────────────────────────────
 
-fn trainer() -> Trainer<AB> {
-    Trainer::<AB>::new(
+fn trainer() -> Trainer {
+    Trainer::new(
         &toy_checkpoint(),
         single_label_config(),
         shared_separable(),
         fast_config(),
-        Default::default(),
+        cpu(),
     )
     .expect("well-formed")
 }
@@ -466,27 +451,33 @@ fn a_partially_trained_model_can_still_be_inspected_deliberately() {
 // ── determinism ─────────────────────────────────────────────────────────────
 
 /// Fingerprint a model by summing each parameter tensor, keyed by path.
+/// Sum a collected `f32` tensor's elements, read from its little-endian bytes.
+fn f32_sum(t: &burn_store::burn_pack::Tensor) -> f32 {
+    t.to_bytes()
+        .expect("tensor bytes")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .sum()
+}
+
 fn weights_of(bundle: &[u8]) -> Vec<(String, f32)> {
     use burn_store::ModuleSnapshot;
 
     let module = Bundle::unpack(bundle)
         .expect("unpacks")
-        .load_module::<B>(&Default::default())
+        .load_module(&cpu())
         .expect("loads");
     let mut sums: Vec<(String, f32)> = module
         .collect(None, None, false)
         .into_iter()
-        .map(|s| {
-            let v = s.to_data().unwrap().into_vec::<f32>().unwrap();
-            (s.full_path(), v.iter().sum())
-        })
+        .map(|s| (s.name.clone(), f32_sum(&s)))
         .collect();
     sums.sort_by(|a, b| a.0.cmp(&b.0));
     sums
 }
 
 fn train_with_seed(checkpoint: &burn_setfit::checkpoint::Checkpoint, seed: u64) -> Vec<u8> {
-    let mut t = Trainer::<AB>::new(
+    let mut t = Trainer::new(
         checkpoint,
         single_label_config(),
         shared_separable(),
@@ -494,7 +485,7 @@ fn train_with_seed(checkpoint: &burn_setfit::checkpoint::Checkpoint, seed: u64) 
             seed,
             ..fast_config()
         },
-        Default::default(),
+        cpu(),
     )
     .expect("well-formed");
     t.fit_with(|_| {}).expect("trains");
@@ -521,8 +512,8 @@ fn the_same_seed_and_checkpoint_reproduce_the_same_model() {
     );
 
     // And the same behaviour, which is what a caller actually observes.
-    let a = Classifier::<B>::from_bundle(&first, Default::default()).expect("loads");
-    let b = Classifier::<B>::from_bundle(&second, Default::default()).expect("loads");
+    let a = Classifier::from_bundle(&first, cpu()).expect("loads");
+    let b = Classifier::from_bundle(&second, cpu()).expect("loads");
     for text in ["a b c", "x y z", "a x b y"] {
         assert_eq!(
             a.classify(text).unwrap().scores,
@@ -550,7 +541,7 @@ fn the_seed_reaches_head_initialisation_not_just_sampling() {
     let checkpoint = toy_checkpoint();
 
     let untrained_head = |seed: u64| {
-        let t = Trainer::<AB>::new(
+        let t = Trainer::new(
             &checkpoint,
             single_label_config(),
             shared_separable(),
@@ -558,7 +549,7 @@ fn the_seed_reaches_head_initialisation_not_just_sampling() {
                 seed,
                 ..fast_config()
             },
-            Default::default(),
+            cpu(),
         )
         .expect("well-formed");
         // Before any step has run, the head is purely its initialisation.
@@ -568,11 +559,11 @@ fn the_seed_reaches_head_initialisation_not_just_sampling() {
     };
 
     use burn_store::ModuleSnapshot;
-    let sums = |m: burn_setfit::model::SetFitModule<B>| -> Vec<f32> {
+    let sums = |m: burn_setfit::model::SetFitModule| -> Vec<f32> {
         m.head
             .collect(None, None, false)
             .into_iter()
-            .map(|s| s.to_data().unwrap().into_vec::<f32>().unwrap().iter().sum())
+            .map(|s| f32_sum(&s))
             .collect()
     };
 

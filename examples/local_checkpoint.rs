@@ -24,15 +24,10 @@
 //! Note what that does *not* show you. The toy body is 32 wide with a
 //! vocabulary of single letters, so every word below tokenizes to `[UNK]` and
 //! the scores mean nothing. It exercises the pipeline, not the model.
-
-use burn::backend::{Autodiff, NdArray};
 use burn_setfit::{
     Checkpoint, Classifier, ClassifierConfig, Example, MiniLmVariant, Reducer, TrainConfig, Trainer,
 };
 use std::path::{Path, PathBuf};
-
-type B = NdArray<f32>;
-type AB = Autodiff<B>;
 
 /// Read the three files a checkpoint is made of.
 ///
@@ -91,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let labels = ["billing", "outage"];
-    let mut trainer = Trainer::<AB>::new(
+    let mut trainer = Trainer::new(
         &checkpoint,
         ClassifierConfig::new(labels),
         training_data(),
@@ -119,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bundle = trainer.finish()?;
     println!("bundle: {:.1} MB", bundle.len() as f64 / 1_048_576.0);
 
-    let classifier = Classifier::<B>::from_bundle(&bundle, Default::default())?;
+    let classifier = Classifier::from_bundle(&bundle, Default::default())?;
     println!("\nheld out from training:");
     for text in [
         "You billed my card three times this week.",

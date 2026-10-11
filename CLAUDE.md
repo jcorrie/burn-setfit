@@ -90,6 +90,13 @@ test names are given so a failure is self-explaining.
   `tests/bundle.rs::a_manifest_whose_windows_outrun_the_position_table_is_refused`,
   `tests/train.rs::a_sequence_budget_beyond_the_bodys_positions_is_rejected_before_training`.
 
+- **`Device::default()` is whichever backend the build happens to have.** Since
+  Burn 0.22 the backend is a runtime value, not a type parameter, and the default
+  prefers a GPU whenever `wgpu` is compiled in. A test written against the
+  default runs on `ndarray` in the main loop and silently moves to wgpu under
+  `--features wgpu` — including the reference side of `tests/wgpu.rs`. Tests name
+  their device: `common::cpu()`, and `gpu()` in `tests/wgpu.rs`.
+
 - **Seeded runs reproduce weights, not bytes.** Burn writes the safetensors
   `__metadata__` map in `HashMap` order. Compare tensors, never file hashes.
 
@@ -99,7 +106,7 @@ test names are given so a failure is self-explaining.
 
 - **`Tensor::into_data()` is a panic on wasm with a GPU backend.** It polls the
   read future once and gives up; a browser cannot block on a buffer map, so the
-  future is always pending there. Lazy `WgpuDevice` acquisition goes through the
+  future is always pending there. Lazy wgpu device acquisition goes through the
   same `block_on`, which is why the trap lands while a tensor is being *built*,
   before any readback, and reports only `unreachable`. Every readback therefore
   goes through `src/readback.rs`, and the `_async` methods are the real
