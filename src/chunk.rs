@@ -158,11 +158,29 @@ struct Segment {
 }
 
 /// Streaming, bounded-memory splitter over an iterator of text pieces.
+///
+/// Consumption is a cursor into `buffer` rather than a `drain` per segment, and
+/// the boundary search remembers how far it has already looked. Both matter
+/// because `classify` hands over a whole document as a single piece: draining
+/// shifted the remaining document once per segment, and re-scanning for a
+/// paragraph break that does not exist walked it once per segment too — each
+/// quadratic in document length, and a 1 MB document without a blank line
+/// spent seconds here before the encoder saw a token.
 struct Segmenter<I> {
     source: I,
     buffer: String,
+    /// Bytes of `buffer` already handed out. Dropped in bulk by [`Self::compact`].
+    start: usize,
     /// Byte offset, in the logical document, of `buffer[0]`.
     buffer_start: usize,
+    /// No `\n\n` pair begins in `start..para_scanned`.
+    para_scanned: usize,
+    /// Where the first `\n\n` pair at or after `start` begins, once seen.
+    para: Option<usize>,
+    /// No sentence end sits in `start..sentence_scanned`.
+    sentence_scanned: usize,
+    /// Where the first sentence-ending punctuation at or after `start` is, once seen.
+    sentence: Option<usize>,
     exhausted: bool,
 }
 
@@ -171,34 +189,64 @@ impl<I: Iterator<Item = String>> Segmenter<I> {
         Self {
             source,
             buffer: String::new(),
+            start: 0,
             buffer_start: 0,
+            para_scanned: 0,
+            para: None,
+            sentence_scanned: 0,
+            sentence: None,
             exhausted: false,
         }
     }
 
-    /// Byte index just past the first segment boundary in `s`, if any.
+    /// Byte index just past the first segment boundary in the unconsumed
+    /// buffer, if any.
     ///
     /// A paragraph break wins over a sentence end; both consume the trailing
-    /// whitespace so it does not open the next segment.
-    fn find_boundary(s: &str) -> Option<usize> {
-        let bytes = s.as_bytes();
-        let mut para: Option<usize> = None;
-        let mut sentence: Option<usize> = None;
+    /// whitespace so it does not open the next segment. A candidate in the last
+    /// byte is undecided — whether it is a boundary depends on the byte after
+    /// it — so each scan stops one short of the end and resumes there once
+    /// more text arrives.
+    fn find_boundary(&mut self) -> Option<usize> {
+        let bytes = self.buffer.as_bytes();
+        let decidable = bytes.len().saturating_sub(1);
 
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'\n' && bytes.get(i + 1) == Some(&b'\n') {
-                para = Some(consume_whitespace(s, i));
-                break;
-            }
-            if matches!(b, b'.' | b'!' | b'?')
-                && sentence.is_none()
-                && bytes.get(i + 1).is_some_and(|c| c.is_ascii_whitespace())
-            {
-                sentence = Some(consume_whitespace(s, i + 1));
-            }
+        if self.para.is_none() {
+            let from = self.para_scanned.max(self.start);
+            self.para = (from..decidable).find(|&i| bytes[i] == b'\n' && bytes[i + 1] == b'\n');
+            self.para_scanned = self.para.unwrap_or(decidable.max(from));
+        }
+        if let Some(i) = self.para {
+            return Some(consume_whitespace(&self.buffer, i));
         }
 
-        para.or(sentence)
+        if self.sentence.is_none() {
+            let from = self.sentence_scanned.max(self.start);
+            self.sentence = (from..decidable).find(|&i| {
+                matches!(bytes[i], b'.' | b'!' | b'?') && bytes[i + 1].is_ascii_whitespace()
+            });
+            self.sentence_scanned = self.sentence.unwrap_or(decidable.max(from));
+        }
+        self.sentence
+            .map(|i| consume_whitespace(&self.buffer, i + 1))
+    }
+
+    /// Drop consumed text once it is at least half the buffer.
+    ///
+    /// Halving amortises the copy to O(1) per byte while keeping the buffer
+    /// within twice its unconsumed contents, so streaming stays bounded.
+    fn compact(&mut self) {
+        if self.start == 0 || self.start < self.buffer.len() - self.start {
+            return;
+        }
+        let shift = self.start;
+        self.buffer.drain(..shift);
+        self.buffer_start += shift;
+        self.start = 0;
+        self.para_scanned = self.para_scanned.saturating_sub(shift);
+        self.sentence_scanned = self.sentence_scanned.saturating_sub(shift);
+        self.para = self.para.map(|i| i - shift);
+        self.sentence = self.sentence.map(|i| i - shift);
     }
 }
 
@@ -228,23 +276,30 @@ impl<I: Iterator<Item = String>> Iterator for Segmenter<I> {
     type Item = Segment;
 
     fn next(&mut self) -> Option<Segment> {
+        if self.exhausted {
+            return None;
+        }
         loop {
-            if let Some(end) = Self::find_boundary(&self.buffer) {
+            if let Some(end) = self.find_boundary() {
                 return Some(self.take(end));
             }
 
             // No boundary yet, and the buffer has grown past what we are willing
             // to hold. Cut it anyway — bounded memory beats a clean split here.
-            if self.buffer.len() >= MAX_SEGMENT_BYTES {
-                let end = floor_char_boundary(&self.buffer, MAX_SEGMENT_BYTES);
+            let pending = &self.buffer[self.start..];
+            if pending.len() >= MAX_SEGMENT_BYTES {
+                let end = self.start + floor_char_boundary(pending, MAX_SEGMENT_BYTES);
                 return Some(self.take(end));
             }
 
             match self.source.next() {
-                Some(piece) => self.buffer.push_str(&piece),
+                Some(piece) => {
+                    self.compact();
+                    self.buffer.push_str(&piece);
+                }
                 None => {
                     self.exhausted = true;
-                    if self.buffer.trim().is_empty() {
+                    if pending.trim().is_empty() {
                         return None;
                     }
                     let end = self.buffer.len();
@@ -256,11 +311,18 @@ impl<I: Iterator<Item = String>> Iterator for Segmenter<I> {
 }
 
 impl<I> Segmenter<I> {
-    /// Split `end` bytes off the front of the buffer as a segment.
+    /// Split the unconsumed buffer up to `end` off as a segment.
     fn take(&mut self, end: usize) -> Segment {
-        let text: String = self.buffer.drain(..end).collect();
-        let range = self.buffer_start..self.buffer_start + end;
-        self.buffer_start += end;
+        let text = self.buffer[self.start..end].to_string();
+        let range = self.buffer_start + self.start..self.buffer_start + end;
+        self.start = end;
+        // A boundary already found but now consumed no longer marks the next one.
+        if self.para.is_some_and(|i| i < end) {
+            self.para = None;
+        }
+        if self.sentence.is_some_and(|i| i < end) {
+            self.sentence = None;
+        }
         Segment {
             text,
             byte_range: range,
