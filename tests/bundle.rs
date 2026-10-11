@@ -42,6 +42,30 @@ fn every_configuration_field_survives_the_container() {
 }
 
 #[test]
+fn packing_the_same_model_twice_gives_the_same_bytes() {
+    // Burn writes the safetensors `__metadata__` map in `HashMap` order, which
+    // differs between two maps in the same process. Unless `pack` canonicalises
+    // the header, two packs of one model differ in bytes, and a bundle cannot be
+    // content-addressed (cache keys, ETags, reproducibility checks). Several
+    // rounds, because two packs can land in the same order by chance.
+    use burn_setfit::quantize::Quantization;
+
+    let bundle = Bundle::unpack(&toy_bundle(config())).expect("unpacks");
+    let module = bundle.load_module(&cpu()).expect("loads");
+    for quantization in [Quantization::None, Quantization::F16, Quantization::Int8] {
+        let manifest = bundle.manifest.clone().with_quantization(quantization);
+        let first = Bundle::pack(&module, &manifest, &bundle.tokenizer).expect("packs");
+        for _ in 0..8 {
+            let again = Bundle::pack(&module, &manifest, &bundle.tokenizer).expect("packs");
+            assert!(
+                first == again,
+                "{quantization:?}: two packs of one model differ in bytes"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_tokenizer_travels_with_the_weights() {
     let bundle = Bundle::unpack(&toy_bundle(config())).expect("unpacks");
     assert_eq!(bundle.tokenizer, toy_tokenizer_json());

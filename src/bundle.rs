@@ -9,12 +9,11 @@
 //! handful of slice reads and no allocator tricks, which is what you want in the
 //! one environment where the file arrives as a single `ArrayBuffer`.
 //!
-//! ```text
-//! Note on reproducibility: a seeded training run produces identical *weights*,
-//! but not identical *bytes*. Burn writes the safetensors `__metadata__` map in
-//! `HashMap` order, and Rust seeds each map differently, so the header keys come
-//! out in a different order each time. Compare models by their tensors, not by
-//! hashing the file — content-addressing a bundle will not work.
+//! Packing is byte-canonical: the same model, manifest and tokenizer always
+//! pack to the same bytes, so a bundle can be content-addressed. That takes
+//! work, because burn-store writes the safetensors `__metadata__` map in
+//! `HashMap` order and two maps in one process order their keys differently;
+//! `canonical_safetensors` rewrites the header with every key sorted.
 //!
 //! ```text
 //! "BSETFIT\x00"   8 bytes   magic
@@ -29,13 +28,23 @@ use crate::error::{Result, SetFitError};
 use crate::head::TaskMode;
 use crate::minilm::{MiniLmConfig, MiniLmVariant, check_sequence_budget};
 use crate::model::SetFitModule;
+use crate::quantize::{self, Quantization};
 use crate::tokenize::Tokenizer;
 use burn::tensor::Device;
 use burn_store::{ModuleSnapshot, SafetensorsStore};
 
 const MAGIC: &[u8; 8] = b"BSETFIT\x00";
-/// Bundle format version written by this crate.
-pub const FORMAT_VERSION: u32 = 1;
+/// Highest bundle format version this build can read.
+///
+/// Version 2 added quantized weights. A bundle only claims 2 when it actually
+/// carries them, so every unquantized bundle this crate writes is still a
+/// version 1 file that an older build reads unchanged — and an older build
+/// meets a quantized one with an honest "cannot read version 2" instead of
+/// loading f16 bytes as though they were f32.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The version written when weights are stored exactly as trained.
+const FORMAT_VERSION_PLAIN: u32 = 1;
 
 /// Everything about a trained model that is not a weight.
 ///
@@ -62,6 +71,14 @@ pub struct Manifest {
     pub body: MiniLmConfig,
     /// How the trained model classifies.
     pub classifier: ClassifierConfig,
+    /// How the weights are stored, which says nothing about how they compute.
+    ///
+    /// Weights are expanded back to `f32` before Burn sees them, so this
+    /// changes the size of the file and the precision of what was written to
+    /// it, and nothing else. `#[serde(default)]` so bundles written before this
+    /// field existed still parse, as [`Quantization::None`].
+    #[serde(default)]
+    pub quantization: Quantization,
 }
 
 impl Manifest {
@@ -71,7 +88,14 @@ impl Manifest {
             variant,
             body,
             classifier,
+            quantization: Quantization::None,
         }
+    }
+
+    /// The same manifest, describing weights stored at the given precision.
+    pub fn with_quantization(mut self, quantization: Quantization) -> Self {
+        self.quantization = quantization;
+        self
     }
 
     /// Number of classes.
@@ -201,8 +225,48 @@ fn read_blob(bytes: &[u8], at: usize, len: usize, what: &str) -> Result<Vec<u8>>
         .ok_or_else(|| SetFitError::Bundle(format!("bundle truncated inside {what}")))
 }
 
+/// Rewrite a safetensors blob's JSON header with every object's keys sorted.
+///
+/// The header is the only part burn-store writes in an unstable order: its
+/// `__metadata__` comes from a `HashMap`. Tensor entries locate their data by
+/// byte offsets, so reordering keys moves nothing in the data section, which is
+/// copied through untouched. `serde_json::Value` objects are `BTreeMap`s in this
+/// build (no `preserve_order`), so parsing and re-serialising is the sort.
+///
+/// The format allows trailing spaces after the JSON, and the header is padded
+/// with them to a multiple of eight bytes so the data stays aligned, as the
+/// reference writer does.
+fn canonical_safetensors(blob: &[u8]) -> Result<Vec<u8>> {
+    let bad = |why: &str| SetFitError::Store(format!("canonicalising the weights: {why}"));
+    let len_bytes: [u8; 8] = blob
+        .get(..8)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| bad("shorter than a safetensors header length"))?;
+    let header_len = usize::try_from(u64::from_le_bytes(len_bytes))
+        .map_err(|_| bad("header length does not fit in memory"))?;
+    let header = blob
+        .get(8..8 + header_len)
+        .ok_or_else(|| bad("header runs past the end of the blob"))?;
+    let data = &blob[8 + header_len..];
+
+    let value: serde_json::Value =
+        serde_json::from_slice(header).map_err(|e| bad(&e.to_string()))?;
+    let mut json = serde_json::to_vec(&value).map_err(|e| bad(&e.to_string()))?;
+    json.resize(json.len().next_multiple_of(8), b' ');
+
+    let mut out = Vec::with_capacity(8 + json.len() + data.len());
+    out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    out.extend_from_slice(&json);
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
 impl Bundle {
     /// Serialise a trained model into the container format.
+    ///
+    /// Weights are stored at whatever precision `manifest.quantization` names;
+    /// [`Self::load_module`] expands them back to `f32`, so the choice is
+    /// invisible to everything downstream of the file.
     pub fn pack(
         module: &SetFitModule,
         manifest: &Manifest,
@@ -223,6 +287,8 @@ impl Bundle {
         let weights = store
             .get_bytes()
             .map_err(|e| SetFitError::Store(e.to_string()))?;
+        let weights = quantize::compress(&weights, manifest.quantization)?;
+        let weights = canonical_safetensors(&weights)?;
 
         let manifest_json =
             serde_json::to_vec(manifest).map_err(|e| SetFitError::Config(e.to_string()))?;
@@ -231,7 +297,15 @@ impl Bundle {
             8 + 4 + 4 + manifest_json.len() + 8 + weights.len() + 8 + tokenizer_json.len(),
         );
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        // Only claim the newer version when the file actually needs it, so an
+        // older build keeps reading ordinary bundles and refuses only the ones
+        // it would misread.
+        let version = if manifest.quantization.is_lossless() {
+            FORMAT_VERSION_PLAIN
+        } else {
+            FORMAT_VERSION
+        };
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&(manifest_json.len() as u32).to_le_bytes());
         out.extend_from_slice(&manifest_json);
         out.extend_from_slice(&(weights.len() as u64).to_le_bytes());
@@ -249,9 +323,10 @@ impl Bundle {
         }
 
         let version = read_u32(bytes, 8)?;
-        if version != FORMAT_VERSION {
+        if version == 0 || version > FORMAT_VERSION {
             return Err(SetFitError::Bundle(format!(
-                "bundle format version {version}, but this build reads version {FORMAT_VERSION}"
+                "bundle format version {version}, but this build reads up to version \
+                 {FORMAT_VERSION}"
             )));
         }
 
@@ -283,7 +358,15 @@ impl Bundle {
     pub fn load_module(&self, device: &Device) -> Result<SetFitModule> {
         let mut module =
             SetFitModule::init(&self.manifest.body, self.manifest.num_labels(), device);
-        let mut store = SafetensorsStore::from_bytes(Some(self.weights.clone()));
+        // Back to f32 before Burn sees a byte of it. burn-store preserves the
+        // stored dtype on load, so handing it f16 would build an f16 module
+        // rather than the f32 one every other path assumes.
+        let weights = if self.manifest.quantization.is_lossless() {
+            self.weights.clone()
+        } else {
+            quantize::expand(&self.weights)?
+        };
+        let mut store = SafetensorsStore::from_bytes(Some(weights));
         module
             .load_from(&mut store)
             .map_err(|e| SetFitError::Store(e.to_string()))?;

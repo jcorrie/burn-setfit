@@ -492,13 +492,12 @@ fn train_with_seed(checkpoint: &burn_setfit::checkpoint::Checkpoint, seed: u64) 
     t.finish().expect("packs")
 }
 
-/// A seeded run must reproduce the same *model*.
+/// A seeded run must reproduce the same *model*, down to the bundle's bytes.
 ///
-/// Deliberately not a byte comparison. Burn writes the safetensors
-/// `__metadata__` map in `HashMap` order, which Rust seeds per map, so two
-/// bit-identical models serialise to headers whose keys are in different orders.
-/// The weights are the claim worth making; the container is not byte-canonical,
-/// which matters only if you were hoping to content-address the artifact.
+/// The bytes only match because `Bundle::pack` canonicalises the safetensors
+/// header; burn-store writes its `__metadata__` in `HashMap` order. The weight
+/// and prediction checks stay, because they say *what* differs when the byte
+/// check fails.
 #[test]
 fn the_same_seed_and_checkpoint_reproduce_the_same_model() {
     let checkpoint = toy_checkpoint();
@@ -509,6 +508,10 @@ fn the_same_seed_and_checkpoint_reproduce_the_same_model() {
         weights_of(&first),
         weights_of(&second),
         "a seeded run must reproduce the same weights"
+    );
+    assert!(
+        first == second,
+        "same weights, different bytes: is Bundle::pack still canonicalising the header?"
     );
 
     // And the same behaviour, which is what a caller actually observes.

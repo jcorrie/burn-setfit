@@ -182,6 +182,7 @@ pub mod head;
 pub mod infer;
 pub mod minilm;
 pub mod model;
+pub mod quantize;
 mod readback;
 pub mod reduce;
 pub mod tokenize;
@@ -199,8 +200,9 @@ pub use chunk::ChunkConfig;
 pub use config::ClassifierConfig;
 pub use error::{Result, SetFitError};
 pub use head::TaskMode;
-pub use infer::{Classifier, Evidence, Prediction};
+pub use infer::{ChunkPrediction, Classifier, Evidence, Prediction};
 pub use minilm::{EMBEDDING_DIM, MiniLmVariant, TRAINED_SEQ_LEN};
+pub use quantize::Quantization;
 pub use reduce::Reducer;
 pub use tokenize::Tokenizer;
 #[cfg(feature = "train")]
