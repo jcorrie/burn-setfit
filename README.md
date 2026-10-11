@@ -413,13 +413,14 @@ it in. Left in place it made every sentence ~94% identical padding and pushed
 unrelated-sentence similarity from 0.10 to 0.90. Regression test in
 `tests/pretrained.rs`.
 
-**A seeded run reproduces the same weights, not the same bytes.** `TrainConfig::seed`
+**A seeded run reproduces the same bundle, byte for byte.** `TrainConfig::seed`
 covers pair sampling, shuffling *and* head initialisation — the last of which
 previously drew from Burn's global RNG, so seeded runs were not actually
-reproducible. The `.setfit` container is still not byte-canonical: Burn writes the
-safetensors `__metadata__` map in `HashMap` order, which Rust seeds per map, so
-identical models serialise to headers whose keys are ordered differently. Compare
-models by their tensors; content-addressing a bundle will not work.
+reproducible. The bytes match because `Bundle::pack` is canonical: burn-store
+writes the safetensors `__metadata__` map in `HashMap` order, which differs from
+one map to the next, so `pack` rewrites the header with every key sorted. A
+bundle can therefore be content-addressed — hashed for a cache key, an ETag, or a
+reproducibility check.
 
 **The head is `use_differentiable_head`**, SetFit's own alternative to the sklearn
 `LogisticRegression` default: a `Linear` layer with AdamW and weight decay. Same

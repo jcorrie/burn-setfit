@@ -9,12 +9,11 @@
 //! handful of slice reads and no allocator tricks, which is what you want in the
 //! one environment where the file arrives as a single `ArrayBuffer`.
 //!
-//! ```text
-//! Note on reproducibility: a seeded training run produces identical *weights*,
-//! but not identical *bytes*. Burn writes the safetensors `__metadata__` map in
-//! `HashMap` order, and Rust seeds each map differently, so the header keys come
-//! out in a different order each time. Compare models by their tensors, not by
-//! hashing the file — content-addressing a bundle will not work.
+//! Packing is byte-canonical: the same model, manifest and tokenizer always
+//! pack to the same bytes, so a bundle can be content-addressed. That takes
+//! work, because burn-store writes the safetensors `__metadata__` map in
+//! `HashMap` order and two maps in one process order their keys differently;
+//! `canonical_safetensors` rewrites the header with every key sorted.
 //!
 //! ```text
 //! "BSETFIT\x00"   8 bytes   magic
@@ -226,6 +225,42 @@ fn read_blob(bytes: &[u8], at: usize, len: usize, what: &str) -> Result<Vec<u8>>
         .ok_or_else(|| SetFitError::Bundle(format!("bundle truncated inside {what}")))
 }
 
+/// Rewrite a safetensors blob's JSON header with every object's keys sorted.
+///
+/// The header is the only part burn-store writes in an unstable order: its
+/// `__metadata__` comes from a `HashMap`. Tensor entries locate their data by
+/// byte offsets, so reordering keys moves nothing in the data section, which is
+/// copied through untouched. `serde_json::Value` objects are `BTreeMap`s in this
+/// build (no `preserve_order`), so parsing and re-serialising is the sort.
+///
+/// The format allows trailing spaces after the JSON, and the header is padded
+/// with them to a multiple of eight bytes so the data stays aligned, as the
+/// reference writer does.
+fn canonical_safetensors(blob: &[u8]) -> Result<Vec<u8>> {
+    let bad = |why: &str| SetFitError::Store(format!("canonicalising the weights: {why}"));
+    let len_bytes: [u8; 8] = blob
+        .get(..8)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| bad("shorter than a safetensors header length"))?;
+    let header_len = usize::try_from(u64::from_le_bytes(len_bytes))
+        .map_err(|_| bad("header length does not fit in memory"))?;
+    let header = blob
+        .get(8..8 + header_len)
+        .ok_or_else(|| bad("header runs past the end of the blob"))?;
+    let data = &blob[8 + header_len..];
+
+    let value: serde_json::Value =
+        serde_json::from_slice(header).map_err(|e| bad(&e.to_string()))?;
+    let mut json = serde_json::to_vec(&value).map_err(|e| bad(&e.to_string()))?;
+    json.resize(json.len().next_multiple_of(8), b' ');
+
+    let mut out = Vec::with_capacity(8 + json.len() + data.len());
+    out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    out.extend_from_slice(&json);
+    out.extend_from_slice(data);
+    Ok(out)
+}
+
 impl Bundle {
     /// Serialise a trained model into the container format.
     ///
@@ -253,6 +288,7 @@ impl Bundle {
             .get_bytes()
             .map_err(|e| SetFitError::Store(e.to_string()))?;
         let weights = quantize::compress(&weights, manifest.quantization)?;
+        let weights = canonical_safetensors(&weights)?;
 
         let manifest_json =
             serde_json::to_vec(manifest).map_err(|e| SetFitError::Config(e.to_string()))?;

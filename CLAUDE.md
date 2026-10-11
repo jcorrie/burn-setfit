@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-166 tests, about two seconds, no network. Stay in this loop. Anything touching
+167 tests, about two seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -122,8 +122,14 @@ test names are given so a failure is self-explaining.
   it f16 would silently build an f16 module rather than the f32 one every other
   path assumes. Do not "optimise" the expand step away.
 
-- **Seeded runs reproduce weights, not bytes.** Burn writes the safetensors
-  `__metadata__` map in `HashMap` order. Compare tensors, never file hashes.
+- **Bundles are byte-canonical only because `pack` makes them so.** burn-store
+  writes the safetensors `__metadata__` map in `HashMap` order, which differs
+  between two maps in one process, so the raw bytes of two saves of one model
+  differ. `Bundle::pack` rewrites the header with sorted keys; anything that
+  writes weights another way (a new quantization path, say) must go through
+  `canonical_safetensors` too, or bundle hashes stop meaning anything.
+  Guards: `tests/bundle.rs::packing_the_same_model_twice_gives_the_same_bytes`,
+  `tests/train.rs::the_same_seed_and_checkpoint_reproduce_the_same_model`.
 
 - **`min_final_tokens` governs the trailing chunk only.** Intermediate windows are
   boundary-aligned and routinely short; a blanket minimum would discard ordinary
