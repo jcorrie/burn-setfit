@@ -6,7 +6,6 @@
 
 use super::model::MiniLmModel;
 use crate::error::SetFitError;
-use burn::tensor::backend::Backend;
 use burn_store::{KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 
 /// Maps HuggingFace BERT parameter names onto Burn's `TransformerEncoder` layout.
@@ -47,8 +46,8 @@ pub enum Naming {
 }
 
 /// Load safetensors weights into an initialised model.
-pub fn load_weights<B: Backend>(
-    model: &mut MiniLmModel<B>,
+pub fn load_weights(
+    model: &mut MiniLmModel,
     bytes: Vec<u8>,
     naming: Naming,
 ) -> Result<(), SetFitError> {
@@ -74,9 +73,6 @@ pub fn load_weights<B: Backend>(
 }
 
 /// Load HuggingFace-format safetensors weights into an initialised model.
-pub fn load_hf_weights<B: Backend>(
-    model: &mut MiniLmModel<B>,
-    bytes: Vec<u8>,
-) -> Result<(), SetFitError> {
+pub fn load_hf_weights(model: &mut MiniLmModel, bytes: Vec<u8>) -> Result<(), SetFitError> {
     load_weights(model, bytes, Naming::HuggingFace)
 }

@@ -6,15 +6,11 @@
 //! weights the way BERT does. If they diverge, this says where.
 //!
 //! Run with: `cargo run --release --example reference`
-
-use burn::backend::NdArray;
 use burn_setfit::checkpoint::Checkpoint;
 use burn_setfit::minilm::MiniLmVariant;
 use burn_setfit::model::embed_body;
 use burn_setfit::tokenize::pad_batch;
 use safetensors::SafeTensors;
-
-type B = NdArray<f32>;
 
 struct Weights<'a> {
     st: SafeTensors<'a>,
@@ -255,7 +251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Default::default();
     let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
     let tokenizer = checkpoint.tokenizer()?;
-    let body = checkpoint.body::<B>(&device)?;
+    let body = checkpoint.body(&device)?;
     let weights = Weights {
         st: SafeTensors::deserialize(&checkpoint.weights)?,
     };
@@ -272,9 +268,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ids = tokenizer.encode_full(s, 256)?;
 
         // Burn path, one sentence at a time so no padding is involved.
-        let (input_ids, mask) = pad_batch::<B>(core::slice::from_ref(&ids), 0, &device);
+        let (input_ids, mask) = pad_batch(core::slice::from_ref(&ids), 0, &device);
         let e = embed_body(&body, input_ids, mask);
-        ours.push(e.into_data().into_vec::<f32>().unwrap());
+        ours.push(e.into_data().try_into_vec::<f32>().unwrap());
 
         theirs.push(reference_embed(&weights, &ids, &checkpoint.config));
     }

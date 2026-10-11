@@ -44,13 +44,13 @@ Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
 ## Quick start
 
 ```rust
-use burn::backend::{Autodiff, NdArray};
+use burn::tensor::Device;
 use burn_setfit::{Checkpoint, Classifier, ClassifierConfig, Example, MiniLmVariant,
                   TrainConfig, Trainer};
 
 let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
 
-let mut trainer = Trainer::<Autodiff<NdArray<f32>>>::new(
+let mut trainer = Trainer::new(
     &checkpoint,
     ClassifierConfig::new(["billing", "outage"]),
     vec![
@@ -59,7 +59,7 @@ let mut trainer = Trainer::<Autodiff<NdArray<f32>>>::new(
         // ...eight or so per class
     ],
     TrainConfig::default(),
-    Default::default(),
+    Device::default(), // the backend is a runtime choice; autodiff is added for you
 )?;
 trainer.fit_with(|p| eprintln!("{:?} {}/{}", p.stage, p.step, p.total_steps))?;
 
@@ -71,7 +71,7 @@ Then classify from those bytes alone — the same code path natively and in the
 browser:
 
 ```rust
-let classifier = Classifier::<NdArray<f32>>::from_bundle(&bundle, Default::default())?;
+let classifier = Classifier::from_bundle(&bundle, Device::default())?;
 let prediction = classifier.classify(very_long_document)?;
 ```
 
@@ -118,9 +118,9 @@ One type, [`SetFitError`], across the whole crate, and `?` composes with
 than a `Box<dyn Error>`:
 
 ```rust
-fn load(path: &str) -> burn_setfit::Result<Classifier<NdArray<f32>>> {
-    let bytes = std::fs::read(path)?;                    // io::Error
-    Classifier::from_bundle(&bytes, Default::default())  // SetFitError
+fn load(path: &str) -> burn_setfit::Result<Classifier> {
+    let bytes = std::fs::read(path)?;                   // io::Error
+    Classifier::from_bundle(&bytes, Device::default())  // SetFitError
 }
 ```
 
@@ -372,7 +372,7 @@ reason — see the design notes.
 
 WebGPU has no synchronous readback. A browser cannot block a thread on a GPU
 buffer map, so Burn's `Tensor::into_data()` polls the map future once, finds it
-pending and panics. Lazy `WgpuDevice` acquisition goes through the same
+pending and panics. Lazy wgpu device acquisition goes through the same
 `block_on`, so the trap arrives even earlier — while a tensor is being built,
 before anything is read. The combination used to compile and then die in the
 browser as a bare `unreachable`, with nothing in the message naming the cause.
@@ -395,7 +395,7 @@ panicking inside Burn.
 
 Two things stay the caller's job on that target:
 
-- **Bring the device up first**, with `burn::backend::wgpu::init_setup_async`.
+- **Bring the device up first**, with `Device::wgpu_options().init_async()`.
   The lazy path cannot work, and without this the trap happens while the first
   tensor is built, before any readback.
 - **Ask for it explicitly**, with `wgpu-wasm-unverified`. The combination

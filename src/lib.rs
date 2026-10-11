@@ -34,13 +34,15 @@
 //! # Training
 //!
 //! ```no_run
-//! use burn::backend::{Autodiff, NdArray};
+//! use burn::tensor::Device;
 //! use burn_setfit::{Checkpoint, ClassifierConfig, Example, MiniLmVariant, TrainConfig, Trainer};
 //!
 //! # fn main() -> burn_setfit::Result<()> {
 //! let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
 //!
-//! let mut trainer = Trainer::<Autodiff<NdArray<f32>>>::new(
+//! // Burn picks the backend at run time, from the device. `Trainer` turns
+//! // autodiff on for itself, so any device will do.
+//! let mut trainer = Trainer::new(
 //!     &checkpoint,
 //!     ClassifierConfig::new(["billing", "outage"]),
 //!     vec![
@@ -49,7 +51,7 @@
 //!         // ...eight or so per class
 //!     ],
 //!     TrainConfig::default(),
-//!     Default::default(),
+//!     Device::default(),
 //! )?;
 //!
 //! trainer.fit_with(|p| eprintln!("{:?} {}/{}", p.stage, p.step, p.total_steps))?;
@@ -66,13 +68,13 @@
 //! From those bytes alone — the same code path natively and in a browser:
 //!
 //! ```no_run
-//! use burn::backend::NdArray;
+//! use burn::tensor::Device;
 //! use burn_setfit::{Classifier, Reducer};
 //!
 //! # fn main() -> burn_setfit::Result<()> {
 //! # let bundle: Vec<u8> = Vec::new();
 //! # let very_long_document = "";
-//! let classifier = Classifier::<NdArray<f32>>::from_bundle(&bundle, Default::default())?;
+//! let classifier = Classifier::from_bundle(&bundle, Device::default())?;
 //! let prediction = classifier.classify(very_long_document)?;
 //!
 //! for label in prediction.labels(classifier.manifest()) {
@@ -119,7 +121,7 @@
 //!
 //! WebGPU has no synchronous readback. A browser cannot block a thread on a GPU
 //! buffer map, so Burn's `Tensor::into_data()` polls the map future once, finds
-//! it pending and panics. Lazy `WgpuDevice` acquisition goes through the same
+//! it pending and panics. Lazy wgpu device acquisition goes through the same
 //! `block_on`, so the trap arrives even earlier — while a tensor is being
 //! built, before anything is read.
 //!
@@ -135,7 +137,8 @@
 //!
 //! Two things remain the caller's job on that target. The device must be
 //! brought up before any tensor exists, with
-//! `burn::backend::wgpu::init_setup_async`, because the lazy path cannot work.
+//! `Device::wgpu_options().init_async()`, and the device it returns is the one
+//! to hand to [`Classifier`] or [`Trainer`], because the lazy path cannot work.
 //! And `wasm32` with `wgpu` must be asked for explicitly, through
 //! `wgpu-wasm-unverified`: the combination compiles and the API it needs is
 //! here, but it has never been run on a GPU in a browser, and the feature is
@@ -164,7 +167,7 @@ compile_error!(
     "`wgpu` on wasm32 needs the `wgpu-wasm-unverified` feature. WebGPU readback \
      and device init are both async, so on this target the backend works only \
      through the `_async` methods, and only if you call \
-     `burn::backend::wgpu::init_setup_async` before building any tensor; the \
+     `Device::wgpu_options().init_async()` before building any tensor; the \
      blocking methods report `SetFitError::Readback` instead. The combination \
      has never been executed on a GPU. Build wasm with `ndarray` for the tested \
      path. See https://github.com/jcorrie/burn-setfit/issues/5"

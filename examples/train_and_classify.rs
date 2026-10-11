@@ -4,17 +4,12 @@
 //! `all-MiniLM-L6-v2` on first run.
 //!
 //! Run with: `cargo run --release --example train_and_classify`
-
-use burn::backend::{Autodiff, NdArray};
 use burn_setfit::checkpoint::Checkpoint;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::infer::Classifier;
 use burn_setfit::minilm::MiniLmVariant;
 use burn_setfit::reduce::Reducer;
 use burn_setfit::train::{Example, TrainConfig, Trainer};
-
-type B = NdArray<f32>;
-type AB = Autodiff<B>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Default::default();
@@ -55,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("loading {} ...", MiniLmVariant::L6.model_id());
     let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
 
-    let mut trainer = Trainer::<AB>::new(
+    let mut trainer = Trainer::new(
         &checkpoint,
         ClassifierConfig::new(labels.clone()),
         examples,
@@ -87,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let packed = trainer.finish()?;
     eprintln!("bundle: {:.1} MB\n", packed.len() as f64 / 1_048_576.0);
 
-    let classifier = Classifier::<B>::from_bundle(&packed, Default::default())?;
+    let classifier = Classifier::from_bundle(&packed, Default::default())?;
 
     println!("short inputs held out from training:");
     for text in [
@@ -131,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         // Reduction is a decode-time choice, so it can be varied without
         // retraining or repacking anything.
-        let c = Classifier::<B>::from_bundle(&packed, Default::default())?.with_reducer(reducer);
+        let c = Classifier::from_bundle(&packed, Default::default())?.with_reducer(reducer);
         let p = c.classify(&long_doc)?;
         let (i, score) = p.top().unwrap();
         println!(

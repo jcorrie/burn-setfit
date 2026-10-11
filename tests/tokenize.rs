@@ -1,12 +1,8 @@
 //! Tokenization and batching — where the padding bug lived.
 
 mod common;
-
-use burn::backend::NdArray;
 use burn_setfit::tokenize::{Tokenizer, pad_batch};
-use common::{toy_tokenizer, toy_tokenizer_json_string};
-
-type B = NdArray<f32>;
+use common::{cpu, toy_tokenizer, toy_tokenizer_json_string};
 
 #[test]
 fn special_token_ids_come_from_the_vocabulary() {
@@ -99,13 +95,13 @@ fn empty_text_encodes_to_nothing_but_the_specials() {
 #[test]
 fn a_ragged_batch_pads_to_the_longest_and_masks_the_rest() {
     let sequences = vec![vec![4u32, 5, 6], vec![7], vec![8, 9]];
-    let (ids, mask) = pad_batch::<B>(&sequences, 99, &Default::default());
+    let (ids, mask) = pad_batch(&sequences, 99, &cpu());
 
     assert_eq!(ids.dims(), [3, 3]);
     assert_eq!(mask.dims(), [3, 3]);
 
-    let ids = ids.into_data().into_vec::<i64>().unwrap();
-    let mask = mask.into_data().into_vec::<f32>().unwrap();
+    let ids = ids.into_data().try_into_vec::<i64>().unwrap();
+    let mask = mask.into_data().try_into_vec::<f32>().unwrap();
 
     assert_eq!(ids, vec![4, 5, 6, 7, 99, 99, 8, 9, 99]);
     // Exactly one mask entry per real token, and nothing else.
@@ -115,8 +111,8 @@ fn a_ragged_batch_pads_to_the_longest_and_masks_the_rest() {
 #[test]
 fn a_uniform_batch_needs_no_padding_at_all() {
     let sequences = vec![vec![4u32, 5], vec![6, 7]];
-    let (_, mask) = pad_batch::<B>(&sequences, 0, &Default::default());
-    let mask = mask.into_data().into_vec::<f32>().unwrap();
+    let (_, mask) = pad_batch(&sequences, 0, &cpu());
+    let mask = mask.into_data().try_into_vec::<f32>().unwrap();
     assert!(mask.iter().all(|m| *m == 1.0), "nothing to mask: {mask:?}");
 }
 
@@ -125,8 +121,8 @@ fn the_mask_counts_exactly_the_real_tokens() {
     // Mean pooling divides by this sum, so an off-by-one here rescales every
     // embedding in the batch.
     let sequences = vec![vec![4u32; 7], vec![5u32; 2], vec![6u32; 13]];
-    let (_, mask) = pad_batch::<B>(&sequences, 0, &Default::default());
-    let mask = mask.into_data().into_vec::<f32>().unwrap();
+    let (_, mask) = pad_batch(&sequences, 0, &cpu());
+    let mask = mask.into_data().try_into_vec::<f32>().unwrap();
 
     let width = 13;
     for (row, expected) in [7usize, 2, 13].iter().enumerate() {
@@ -137,7 +133,7 @@ fn the_mask_counts_exactly_the_real_tokens() {
 
 #[test]
 fn a_batch_of_one_is_shaped_like_a_batch() {
-    let (ids, mask) = pad_batch::<B>(&[vec![4u32, 5, 6]], 0, &Default::default());
+    let (ids, mask) = pad_batch(&[vec![4u32, 5, 6]], 0, &cpu());
     assert_eq!(ids.dims(), [1, 3]);
     assert_eq!(mask.dims(), [1, 3]);
 }

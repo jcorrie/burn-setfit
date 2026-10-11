@@ -1,21 +1,17 @@
 //! Classification: decoding, evidence, batching, and the overrides.
 
 mod common;
-
-use burn::backend::NdArray;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::head::TaskMode;
 use burn_setfit::infer::{Classifier, decode, to_probabilities};
 use burn_setfit::reduce::Reducer;
-use common::{small_chunking, toy_bundle, words};
+use common::{cpu, small_chunking, toy_bundle, words};
 
-type B = NdArray<f32>;
-
-fn classifier(config: ClassifierConfig) -> Classifier<B> {
-    Classifier::<B>::from_bundle(&toy_bundle(config), Default::default()).expect("loads")
+fn classifier(config: ClassifierConfig) -> Classifier {
+    Classifier::from_bundle(&toy_bundle(config), cpu()).expect("loads")
 }
 
-fn single_label() -> Classifier<B> {
+fn single_label() -> Classifier {
     classifier(ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking()))
 }
 
@@ -248,7 +244,7 @@ fn the_reducer_can_be_changed_without_repacking() {
     let text = words(400);
 
     let load = |reducer| {
-        Classifier::<B>::from_bundle(&bundle, Default::default())
+        Classifier::from_bundle(&bundle, cpu())
             .unwrap()
             .with_reducer(reducer)
             .classify(&text)
@@ -283,7 +279,7 @@ fn stronger_reducers_dominate_per_label_under_multi_label() {
     let text = words(400);
 
     let load = |reducer| {
-        Classifier::<B>::from_bundle(&bundle, Default::default())
+        Classifier::from_bundle(&bundle, cpu())
             .unwrap()
             .with_reducer(reducer)
             .classify(&text)
@@ -349,12 +345,12 @@ fn hierarchical_reduction_agrees_with_flat_for_the_linear_reducer() {
         toy_bundle(ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking()));
     let text = words(500);
 
-    let flat = Classifier::<B>::from_bundle(&bundle, Default::default())
+    let flat = Classifier::from_bundle(&bundle, cpu())
         .unwrap()
         .with_reducer(Reducer::MeanLogits)
         .classify(&text)
         .unwrap();
-    let tree = Classifier::<B>::from_bundle(&bundle, Default::default())
+    let tree = Classifier::from_bundle(&bundle, cpu())
         .unwrap()
         .with_reducer(Reducer::MeanLogits)
         .with_hierarchy(4)

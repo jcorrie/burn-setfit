@@ -20,10 +20,9 @@ use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant, check_sequence_bud
 use crate::model::{SetFitModule, embed_body};
 use crate::readback::{self, blocking};
 use crate::tokenize::pad_batch;
-use burn::module::AutodiffModule;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
-use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{Int, Tensor};
+use burn::module::Module;
+use burn::optim::{AdamWConfig, GradientsParams, ModuleOptimizer};
+use burn::tensor::{Device, Int, Tensor};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
@@ -198,9 +197,8 @@ pub enum Stage {
 /// What one step accomplished.
 ///
 /// ```no_run
-/// # use burn::backend::{Autodiff, NdArray};
 /// # use burn_setfit::{Stage, Trainer};
-/// # fn drive(trainer: &mut Trainer<Autodiff<NdArray<f32>>>) -> burn_setfit::Result<()> {
+/// # fn drive(trainer: &mut Trainer) -> burn_setfit::Result<()> {
 /// while let Some(p) = trainer.step()? {
 ///     // `total_steps` is known before training starts, so a progress bar needs
 ///     // no guesswork.
@@ -241,13 +239,12 @@ impl Progress {
 /// Natively, run it to completion:
 ///
 /// ```no_run
-/// use burn::backend::{Autodiff, NdArray};
 /// use burn_setfit::{Checkpoint, ClassifierConfig, Example, MiniLmVariant, TrainConfig, Trainer};
 ///
 /// # fn main() -> burn_setfit::Result<()> {
 /// let checkpoint = Checkpoint::download(MiniLmVariant::L6, None)?;
 ///
-/// let mut trainer = Trainer::<Autodiff<NdArray<f32>>>::new(
+/// let mut trainer = Trainer::new(
 ///     &checkpoint,
 ///     ClassifierConfig::new(["billing", "outage"]),
 ///     vec![
@@ -270,9 +267,8 @@ impl Progress {
 /// of fine-tuning does not become a minute of frozen tab.
 ///
 /// ```no_run
-/// # use burn::backend::{Autodiff, NdArray};
 /// # use burn_setfit::Trainer;
-/// # fn drive(trainer: &mut Trainer<Autodiff<NdArray<f32>>>) -> burn_setfit::Result<()> {
+/// # fn drive(trainer: &mut Trainer) -> burn_setfit::Result<()> {
 /// while let Some(progress) = trainer.step()? {
 ///     render(progress.fraction());
 ///     // ...and in wasm, await a frame here before the next step.
@@ -281,11 +277,11 @@ impl Progress {
 /// # }
 /// # fn render(_: f32) {}
 /// ```
-pub struct Trainer<B: AutodiffBackend> {
-    body: MiniLmModel<B>,
-    head: SetFitHead<B>,
-    body_optim: burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, MiniLmModel<B>, B>,
-    head_optim: burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, SetFitHead<B>, B>,
+pub struct Trainer {
+    body: MiniLmModel,
+    head: SetFitHead,
+    body_optim: ModuleOptimizer,
+    head_optim: ModuleOptimizer,
 
     /// Token ids per example, computed once and reused across every pair.
     encoded: Vec<Vec<u32>>,
@@ -293,7 +289,10 @@ pub struct Trainer<B: AutodiffBackend> {
     num_labels: usize,
     task: TaskMode,
     config: TrainConfig,
-    device: B::Device,
+    /// Where the trained modules live: the caller's device with autodiff on.
+    device: Device,
+    /// The same hardware without autodiff, for the frozen body in stage two.
+    inner_device: Device,
     pad_id: u32,
     hidden_size: usize,
 
@@ -316,7 +315,7 @@ pub struct Trainer<B: AutodiffBackend> {
     rng: StdRng,
 }
 
-impl<B: AutodiffBackend> Trainer<B> {
+impl Trainer {
     /// Prepare training from a checkpoint and a classifier configuration.
     ///
     /// Everything needed to emit a finished bundle is captured here — the label
@@ -331,7 +330,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         classifier: ClassifierConfig,
         examples: Vec<Example>,
         config: TrainConfig,
-        device: B::Device,
+        device: Device,
     ) -> Result<Self> {
         checkpoint.validate()?;
         classifier.validate()?;
@@ -383,7 +382,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         let mut rng = StdRng::seed_from_u64(config.seed);
         let pairs = generate_pairs(&examples, config.num_iterations, &mut rng)?;
 
-        let body = checkpoint.body::<B>(&device)?;
+        // Gradients are this type's business, not the caller's: whatever device
+        // arrives, the modules train on its autodiff twin, and `inner` is the
+        // one the frozen body and the finished model go back to.
+        let device = device.autodiff();
+        let inner_device = device.clone().inner();
+        let body = checkpoint.body(&device)?;
         let hidden_size = body.hidden_size();
         // Seeded, so the whole run is reproducible and not just the sampling.
         let head = SetFitHeadConfig::new(hidden_size, num_labels).init_seeded(&device, &mut rng);
@@ -400,7 +404,8 @@ impl<B: AutodiffBackend> Trainer<B> {
             num_labels,
             task: classifier.task,
             config,
-            device: device.clone(),
+            device,
+            inner_device,
             pad_id: tokenizer.special_tokens().pad,
             hidden_size,
             variant: checkpoint.variant,
@@ -499,7 +504,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         sequences.extend(batch.iter().map(|p| self.encoded[p.left].clone()));
         sequences.extend(batch.iter().map(|p| self.encoded[p.right].clone()));
 
-        let (input_ids, attention_mask) = pad_batch::<B>(&sequences, self.pad_id, &self.device);
+        let (input_ids, attention_mask) = pad_batch(&sequences, self.pad_id, &self.device);
         let embeddings = embed_body(&self.body, input_ids, attention_mask);
 
         let dim = embeddings.dims()[1];
@@ -509,7 +514,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         // Embeddings are L2-normalised, so the cosine similarity is just a dot product.
         let cosine = (left * right).sum_dim(1).reshape([n]);
 
-        let targets = Tensor::<B, 1>::from_data(
+        let targets = Tensor::<1>::from_data(
             batch
                 .iter()
                 .map(|p| p.target)
@@ -551,8 +556,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         let mut embeddings = Vec::with_capacity(self.examples.len() * self.hidden_size);
 
         for batch in self.encoded.chunks(self.config.head_batch_size) {
-            let (input_ids, attention_mask) =
-                pad_batch::<B::InnerBackend>(batch, self.pad_id, &self.device);
+            let (input_ids, attention_mask) = pad_batch(batch, self.pad_id, &self.inner_device);
             let embedded = embed_body(&frozen, input_ids, attention_mask);
             embeddings.extend(readback::floats(embedded).await?);
         }
@@ -589,8 +593,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             features.extend_from_slice(&self.embeddings[i * dim..(i + 1) * dim]);
         }
 
-        let features =
-            Tensor::<B, 1>::from_data(features.as_slice(), &self.device).reshape([n, dim]);
+        let features = Tensor::<1>::from_data(features.as_slice(), &self.device).reshape([n, dim]);
         let logits = self.head.forward(features);
 
         let loss = match self.task {
@@ -600,7 +603,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                     // Validated at construction: exactly one label, in range.
                     .map(|&i| self.examples[i].labels[0] as i64)
                     .collect();
-                let targets = Tensor::<B, 1, Int>::from_data(targets.as_slice(), &self.device);
+                let targets = Tensor::<1, Int>::from_data(targets.as_slice(), &self.device);
                 self.head.single_label_loss(logits, targets)
             }
             TaskMode::MultiLabel { .. } => {
@@ -610,7 +613,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                         targets[row * self.num_labels + l] = 1;
                     }
                 }
-                let targets = Tensor::<B, 1, Int>::from_data(targets.as_slice(), &self.device)
+                let targets = Tensor::<1, Int>::from_data(targets.as_slice(), &self.device)
                     .reshape([n, self.num_labels]);
                 self.head.multi_label_loss(logits, targets)
             }
@@ -658,7 +661,7 @@ impl<B: AutodiffBackend> Trainer<B> {
     ///
     /// Available at any point; a partially trained model is a legitimate thing to
     /// inspect. [`Self::finish`] is the one that insists training completed.
-    pub fn into_model(self) -> SetFitModule<B::InnerBackend> {
+    pub fn into_model(self) -> SetFitModule {
         SetFitModule {
             body: self.body.valid(),
             head: self.head.valid(),

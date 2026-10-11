@@ -23,10 +23,9 @@ use std::fmt;
 /// rather than a `Box<dyn Error>`:
 ///
 /// ```no_run
-/// use burn::backend::NdArray;
 /// use burn_setfit::{Classifier, Result};
 ///
-/// fn load(path: &str) -> Result<Classifier<NdArray<f32>>> {
+/// fn load(path: &str) -> Result<Classifier> {
 ///     let bytes = std::fs::read(path)?;             // io::Error
 ///     Classifier::from_bundle(&bytes, Default::default()) // SetFitError
 /// }
