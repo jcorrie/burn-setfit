@@ -9,13 +9,18 @@
 //! - byte-based weight and config loading (no `std::fs`, no `hf-hub`)
 //! - no forced regex backend
 //! - `MiniLmEmbeddingsConfig` made public for bundle round-trips
+//! - the encoder stack is this crate's own rather than Burn's
+//!   `TransformerEncoder`, with the same parameter paths, so GELU can be
+//!   differentiated without `tanh` — see [`MiniLmEncoder`]
 
 mod embedding;
+mod encoder;
 mod loader;
 mod model;
 mod pooling;
 
 pub use embedding::*;
+pub use encoder::*;
 pub use loader::*;
 pub use model::*;
 pub use pooling::*;
