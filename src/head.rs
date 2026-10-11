@@ -13,8 +13,7 @@ use burn::module::Module;
 use burn::nn::loss::{BinaryCrossEntropyLossConfig, CrossEntropyLossConfig};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::{sigmoid, softmax};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{Device, Int, Tensor};
 
 /// Whether a document gets exactly one label or any number of them.
 ///
@@ -102,14 +101,14 @@ pub struct SetFitHeadConfig {
 
 /// A linear classification head over sentence embeddings.
 #[derive(Module, Debug)]
-pub struct SetFitHead<B: Backend> {
+pub struct SetFitHead {
     /// `[input_dim] -> [num_labels]`.
-    pub linear: Linear<B>,
+    pub linear: Linear,
 }
 
 impl SetFitHeadConfig {
     /// Initialise with random weights, drawn from Burn's global RNG.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> SetFitHead<B> {
+    pub fn init(&self, device: &Device) -> SetFitHead {
         SetFitHead {
             linear: LinearConfig::new(self.input_dim, self.num_labels).init(device),
         }
@@ -125,20 +124,16 @@ impl SetFitHeadConfig {
     /// which a library has no business doing on someone else's behalf.
     #[cfg(feature = "train")]
     #[cfg_attr(docsrs, doc(cfg(feature = "train")))]
-    pub fn init_seeded<B: Backend, R: rand::Rng>(
-        &self,
-        device: &B::Device,
-        rng: &mut R,
-    ) -> SetFitHead<B> {
+    pub fn init_seeded<R: rand::Rng>(&self, device: &Device, rng: &mut R) -> SetFitHead {
         use burn::module::Param;
 
         let k = 1.0 / (self.input_dim as f32).sqrt();
         let mut draw = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.random_range(-k..k)).collect() };
 
         let weight =
-            Tensor::<B, 1>::from_data(draw(self.input_dim * self.num_labels).as_slice(), device)
+            Tensor::<1>::from_data(draw(self.input_dim * self.num_labels).as_slice(), device)
                 .reshape([self.input_dim, self.num_labels]);
-        let bias = Tensor::<B, 1>::from_data(draw(self.num_labels).as_slice(), device);
+        let bias = Tensor::<1>::from_data(draw(self.num_labels).as_slice(), device);
 
         SetFitHead {
             linear: Linear {
@@ -149,9 +144,9 @@ impl SetFitHeadConfig {
     }
 }
 
-impl<B: Backend> SetFitHead<B> {
+impl SetFitHead {
     /// Embeddings `[batch, input_dim]` to logits `[batch, num_labels]`.
-    pub fn forward(&self, embeddings: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, embeddings: Tensor<2>) -> Tensor<2> {
         self.linear.forward(embeddings)
     }
 
@@ -161,11 +156,7 @@ impl<B: Backend> SetFitHead<B> {
     }
 
     /// Cross-entropy loss against class indices `[batch]`.
-    pub fn single_label_loss(
-        &self,
-        logits: Tensor<B, 2>,
-        targets: Tensor<B, 1, Int>,
-    ) -> Tensor<B, 1> {
+    pub fn single_label_loss(&self, logits: Tensor<2>, targets: Tensor<1, Int>) -> Tensor<1> {
         let device = logits.device();
         CrossEntropyLossConfig::new()
             .init(&device)
@@ -176,11 +167,7 @@ impl<B: Backend> SetFitHead<B> {
     ///
     /// Each class is scored independently, which is what makes a document able to
     /// carry several labels at once — or none.
-    pub fn multi_label_loss(
-        &self,
-        logits: Tensor<B, 2>,
-        targets: Tensor<B, 2, Int>,
-    ) -> Tensor<B, 1> {
+    pub fn multi_label_loss(&self, logits: Tensor<2>, targets: Tensor<2, Int>) -> Tensor<1> {
         let device = logits.device();
         BinaryCrossEntropyLossConfig::new()
             .with_logits(true)
@@ -189,7 +176,7 @@ impl<B: Backend> SetFitHead<B> {
     }
 
     /// Convert logits to probabilities for the given task mode.
-    pub fn probabilities(logits: Tensor<B, 2>, task: TaskMode) -> Tensor<B, 2> {
+    pub fn probabilities(logits: Tensor<2>, task: TaskMode) -> Tensor<2> {
         match task {
             TaskMode::SingleLabel => softmax(logits, 1),
             TaskMode::MultiLabel { .. } => sigmoid(logits),

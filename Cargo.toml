@@ -5,11 +5,11 @@ members = [".", "crates/setfit-wasm"]
 name = "burn-setfit"
 version = "0.1.0"
 edition = "2024"
-# Measured, not inferred: 1.91 is refused outright because burn 0.21 and
-# cubecl-zspace declare 1.92, and the whole suite passes on 1.92. Our own code
+# Measured, not inferred: 1.94 is refused outright because burn 0.22 and
+# cubecl-zspace declare 1.95, and the whole suite passes on 1.95. Our own code
 # needs less than that — edition 2024 wants 1.85, the let-chains in `config.rs`
 # want 1.88 — so this floor moves with Burn rather than with us.
-rust-version = "1.92"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "SetFit few-shot text classification in Rust with Burn, targeting native and wasm"
 repository = "https://github.com/jcorrie/burn-setfit"
@@ -30,8 +30,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["ndarray", "train", "native"]
 
 # Backends
-# `dep:burn-ndarray` only resolves natively; see the target table below.
-ndarray = ["burn/ndarray", "dep:burn-ndarray"]
+ndarray = ["burn/ndarray"]
 wgpu    = ["burn/wgpu"]
 
 # Opt in to `wgpu` on wasm32, which is refused without it. The combination
@@ -41,14 +40,15 @@ wgpu    = ["burn/wgpu"]
 wgpu-wasm-unverified = ["wgpu"]
 
 # Few-shot training (contrastive body fine-tune + head fit). Works on wasm.
-train = ["burn/autodiff", "dep:rand"]
+# `optim` brings `autodiff` with it.
+train = ["burn/optim", "dep:rand"]
 
 # Filesystem + HuggingFace Hub loading. NOT wasm-compatible.
 native = ["dep:hf-hub", "dep:dirs", "burn/network"]
 
 [dependencies]
-burn        = { version = "0.21.0", default-features = false, features = ["std"] }
-burn-store  = { version = "0.21.0", default-features = false, features = ["std", "safetensors"] }
+burn        = { version = "0.22.0", default-features = false, features = ["std"] }
+burn-store  = { version = "0.22.0", default-features = false, features = ["std", "safetensors"] }
 safetensors = "0.7"
 
 # `unstable_wasm` swaps oniguruma (C, wasm-hostile) for fancy-regex. Works natively too,
@@ -63,11 +63,12 @@ dirs       = { version = "6", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Burn is taken with `default-features = false`, which also strips
-# `burn-ndarray`'s own defaults, so without this every CPU matmul runs on one
-# thread. Native only: wasm32-unknown-unknown has no threads to hand rayon, and
-# target-specific features do not leak into a wasm build of the same tree.
-# `simd` was measured too and bought nothing beyond noise, so it is left off.
-burn-ndarray = { version = "0.21.0", default-features = false, features = ["multi-threads"], optional = true }
+# `burn-ndarray`'s `multi-threads`, so without this every CPU matmul runs on one
+# thread. Burn's `rayon` feature turns it back on. Native only:
+# wasm32-unknown-unknown has no threads to hand rayon, and target-specific
+# features do not leak into a wasm build of the same tree. `simd` was measured
+# too and bought nothing beyond noise, so it is left off.
+burn = { version = "0.22.0", default-features = false, features = ["rayon"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Both majors are live in the tree; each needs its browser entropy backend enabled.
@@ -76,5 +77,5 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 
 [dev-dependencies]
 serde_json = "1"
-burn-store = { version = "0.21.0", default-features = false, features = ["std", "safetensors"] }
-burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+burn-store = { version = "0.22.0", default-features = false, features = ["std", "safetensors"] }
+burn = { version = "0.22.0", default-features = false, features = ["std", "ndarray", "autodiff"] }

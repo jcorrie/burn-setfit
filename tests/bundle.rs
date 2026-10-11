@@ -1,8 +1,6 @@
 //! The `.setfit` container: what survives it, and what it refuses.
 
 mod common;
-
-use burn::backend::NdArray;
 use burn_setfit::bundle::{Bundle, FORMAT_VERSION, Manifest};
 use burn_setfit::chunk::ChunkConfig;
 use burn_setfit::config::ClassifierConfig;
@@ -10,9 +8,9 @@ use burn_setfit::infer::Classifier;
 use burn_setfit::minilm::{MiniLmConfig, MiniLmVariant};
 use burn_setfit::model::SetFitModule;
 use burn_setfit::reduce::Reducer;
-use common::{small_chunking, toy_body_config, toy_bundle, toy_checkpoint, toy_tokenizer_json};
-
-type B = NdArray<f32>;
+use common::{
+    cpu, small_chunking, toy_body_config, toy_bundle, toy_checkpoint, toy_tokenizer_json,
+};
 
 fn config() -> ClassifierConfig {
     ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking())
@@ -55,8 +53,7 @@ fn the_tokenizer_travels_with_the_weights() {
 #[test]
 fn a_bundle_is_self_sufficient() {
     // One fetch, one call, no side files: the property the format exists for.
-    let classifier =
-        Classifier::<B>::from_bundle(&toy_bundle(config()), Default::default()).expect("loads");
+    let classifier = Classifier::from_bundle(&toy_bundle(config()), cpu()).expect("loads");
     assert_eq!(
         classifier.labels(),
         &["alpha".to_string(), "beta".to_string()]
@@ -181,8 +178,8 @@ fn a_window_the_body_can_just_encode_is_accepted() {
 
 #[test]
 fn packing_refuses_a_manifest_that_misdescribes_the_head() {
-    let device = Default::default();
-    let module = SetFitModule::<B>::init(&toy_body_config(), 2, &device);
+    let device = cpu();
+    let module = SetFitModule::init(&toy_body_config(), 2, &device);
 
     // Three names for a two-output head: every score would be attributed to the
     // wrong class, silently, forever.
@@ -203,8 +200,8 @@ fn packing_refuses_a_manifest_that_misdescribes_the_head() {
 
 #[test]
 fn packing_refuses_a_manifest_that_misdescribes_the_body() {
-    let device = Default::default();
-    let module = SetFitModule::<B>::init(&toy_body_config(), 2, &device);
+    let device = cpu();
+    let module = SetFitModule::init(&toy_body_config(), 2, &device);
 
     let mut wrong_body = toy_body_config();
     wrong_body.hidden_size *= 2;
@@ -217,8 +214,8 @@ fn packing_refuses_a_manifest_that_misdescribes_the_body() {
 
 #[test]
 fn packing_refuses_a_bundle_with_no_tokenizer() {
-    let device = Default::default();
-    let module = SetFitModule::<B>::init(&toy_body_config(), 2, &device);
+    let device = cpu();
+    let module = SetFitModule::init(&toy_body_config(), 2, &device);
     let manifest = Manifest::new(MiniLmVariant::L6, toy_body_config(), config());
 
     let err = Bundle::pack(&module, &manifest, &[])
@@ -228,8 +225,8 @@ fn packing_refuses_a_bundle_with_no_tokenizer() {
 
 #[test]
 fn packing_refuses_an_invalid_configuration() {
-    let device = Default::default();
-    let module = SetFitModule::<B>::init(&toy_body_config(), 2, &device);
+    let device = cpu();
+    let module = SetFitModule::init(&toy_body_config(), 2, &device);
     let manifest = Manifest::new(
         MiniLmVariant::L6,
         toy_body_config(),

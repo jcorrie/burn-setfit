@@ -5,29 +5,26 @@
 //! ```text
 //! cargo test --release --features ndarray,train,native -- --ignored
 //! ```
-
-use burn::backend::NdArray;
 use burn_setfit::checkpoint::Checkpoint;
 use burn_setfit::minilm::MiniLmVariant;
 use burn_setfit::model::embed_body;
 use burn_setfit::tokenize::pad_batch;
 
-type B = NdArray<f32>;
-
 fn embeddings(sentences: &[&str]) -> Vec<Vec<f32>> {
-    let device = Default::default();
+    #[allow(deprecated)] // `ndarray` is deprecated upstream in favour of `flex`
+    let device = burn::tensor::Device::ndarray();
     let checkpoint = Checkpoint::download(MiniLmVariant::L6, None).expect("download");
     let tokenizer = checkpoint.tokenizer().expect("tokenizer");
-    let body = checkpoint.body::<B>(&device).expect("weights");
+    let body = checkpoint.body(&device).expect("weights");
 
     sentences
         .iter()
         .map(|s| {
             let ids = tokenizer.encode_full(s, 256).expect("encode");
-            let (input_ids, mask) = pad_batch::<B>(&[ids], 0, &device);
+            let (input_ids, mask) = pad_batch(&[ids], 0, &device);
             embed_body(&body, input_ids, mask)
                 .into_data()
-                .into_vec::<f32>()
+                .try_into_vec::<f32>()
                 .unwrap()
         })
         .collect()

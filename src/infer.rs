@@ -14,7 +14,7 @@ use crate::model::SetFitModule;
 use crate::readback::{self, blocking};
 use crate::reduce::{DocAccumulator, Reducer};
 use crate::tokenize::{Tokenizer, pad_batch};
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 use core::ops::Range;
 
 /// How many chunks are encoded per forward pass.
@@ -39,11 +39,10 @@ pub struct Evidence {
 /// The outcome of classifying one document.
 ///
 /// ```no_run
-/// use burn::backend::NdArray;
 /// use burn_setfit::Classifier;
 ///
 /// # fn main() -> burn_setfit::Result<()> {
-/// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+/// # let classifier = Classifier::from_bundle(&[], Default::default())?;
 /// # let document = "";
 /// let prediction = classifier.classify(document)?;
 ///
@@ -97,13 +96,12 @@ impl Prediction {
 /// A loaded SetFit model, ready to classify.
 ///
 /// ```no_run
-/// use burn::backend::NdArray;
 /// use burn_setfit::{Classifier, Reducer};
 ///
 /// # fn main() -> burn_setfit::Result<()> {
 /// // `?` composes: the file read and the unpack share one error type.
 /// let bundle = std::fs::read("support.setfit")?;
-/// let classifier = Classifier::<NdArray<f32>>::from_bundle(&bundle, Default::default())?;
+/// let classifier = Classifier::from_bundle(&bundle, Default::default())?;
 ///
 /// let prediction = classifier.classify("I was charged twice this month.")?;
 /// println!("{:?} from {} chunks", prediction.labels(classifier.manifest()), prediction.chunks_seen);
@@ -121,23 +119,22 @@ impl Prediction {
 /// refused rather than misinterpreted.
 ///
 /// ```
-/// use burn::backend::NdArray;
 /// use burn_setfit::Classifier;
 ///
-/// assert!(Classifier::<NdArray<f32>>::from_bundle(b"not a bundle", Default::default()).is_err());
+/// assert!(Classifier::from_bundle(b"not a bundle", Default::default()).is_err());
 /// ```
-pub struct Classifier<B: Backend> {
-    module: SetFitModule<B>,
+pub struct Classifier {
+    module: SetFitModule,
     tokenizer: Tokenizer,
     manifest: Manifest,
-    device: B::Device,
+    device: Device,
     batch_size: usize,
     evidence_limit: usize,
 }
 
-impl<B: Backend> Classifier<B> {
+impl Classifier {
     /// Load from packed bundle bytes — a file read natively, a `fetch` in a browser.
-    pub fn from_bundle(bytes: &[u8], device: B::Device) -> Result<Self> {
+    pub fn from_bundle(bytes: &[u8], device: Device) -> Result<Self> {
         let bundle = Bundle::unpack(bytes)?;
         Ok(Self {
             module: bundle.load_module(&device)?,
@@ -151,10 +148,10 @@ impl<B: Backend> Classifier<B> {
 
     /// Assemble from already-loaded parts.
     pub fn new(
-        module: SetFitModule<B>,
+        module: SetFitModule,
         tokenizer: Tokenizer,
         manifest: Manifest,
-        device: B::Device,
+        device: Device,
     ) -> Result<Self> {
         manifest.validate()?;
         Ok(Self {
@@ -197,7 +194,7 @@ impl<B: Backend> Classifier<B> {
     /// sweeping a threshold over a validation set without reloading the model.
     pub fn clone_with_threshold(&self, threshold: f32) -> Self
     where
-        SetFitModule<B>: Clone,
+        SetFitModule: Clone,
     {
         Self {
             module: self.module.clone(),
@@ -265,12 +262,11 @@ impl<B: Backend> Classifier<B> {
     /// ever resident.
     ///
     /// ```no_run
-    /// use burn::backend::NdArray;
     /// use burn_setfit::Classifier;
     /// use std::io::{BufRead, BufReader};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+    /// # let classifier = Classifier::from_bundle(&[], Default::default())?;
     /// // A file of any size, never held in memory as a whole.
     /// let file = BufReader::new(std::fs::File::open("transcript.txt")?);
     /// let lines = file.lines().map_while(std::result::Result::ok).map(|l| l + "\n");
@@ -340,7 +336,7 @@ impl<B: Backend> Classifier<B> {
         evidence: &mut [Vec<Evidence>],
     ) -> Result<()> {
         let sequences: Vec<Vec<u32>> = batch.iter().map(|c| c.ids.clone()).collect();
-        let (input_ids, attention_mask) = pad_batch::<B>(
+        let (input_ids, attention_mask) = pad_batch(
             &sequences,
             self.tokenizer.special_tokens().pad,
             &self.device,
@@ -395,10 +391,9 @@ impl<B: Backend> Classifier<B> {
     /// `sentence-transformers` does. Long documents belong in [`Self::classify`].
     ///
     /// ```no_run
-    /// # use burn::backend::NdArray;
     /// # use burn_setfit::Classifier;
     /// # fn main() -> burn_setfit::Result<()> {
-    /// # let classifier = Classifier::<NdArray<f32>>::from_bundle(&[], Default::default())?;
+    /// # let classifier = Classifier::from_bundle(&[], Default::default())?;
     /// let vectors = classifier.embed(&["The weather is lovely today.", "It's so sunny outside!"])?;
     ///
     /// // L2-normalised, so cosine similarity is a dot product.
@@ -424,7 +419,7 @@ impl<B: Backend> Classifier<B> {
             sequences.push(self.tokenizer.encode_full(t, max_tokens)?);
         }
 
-        let (input_ids, attention_mask) = pad_batch::<B>(
+        let (input_ids, attention_mask) = pad_batch(
             &sequences,
             self.tokenizer.special_tokens().pad,
             &self.device,

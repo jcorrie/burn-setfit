@@ -6,9 +6,22 @@
 //! The vocabulary is the single letters `a`–`z`, which makes token counts
 //! trivially predictable: the text `"a b c"` is exactly three tokens.
 
+use burn::tensor::Device;
 use burn_setfit::checkpoint::Checkpoint;
 use burn_setfit::minilm::{MiniLmConfig, MiniLmVariant};
 use burn_setfit::tokenize::Tokenizer;
+
+/// The `ndarray` device, named rather than defaulted.
+///
+/// Burn 0.22 picks a backend at run time, and `Device::default()` prefers a GPU
+/// whenever the `wgpu` feature is compiled in — so under `--features wgpu` a
+/// defaulted device would quietly move every "CPU" test onto wgpu, including the
+/// reference side of `tests/wgpu.rs`. Upstream deprecates `ndarray` in favour of
+/// `flex`; this crate's CPU feature is still `ndarray`, so that is what tests run.
+#[allow(deprecated)]
+pub fn cpu() -> Device {
+    Device::ndarray()
+}
 
 pub fn toy_tokenizer() -> Tokenizer {
     Tokenizer::from_bytes(toy_tokenizer_json_string().as_bytes())
@@ -88,12 +101,11 @@ pub fn toy_tokenizer_json() -> Vec<u8> {
 /// Lets tests drive the same `Checkpoint`-based API real callers use, rather than
 /// a separate construction path that could drift away from it.
 pub fn toy_checkpoint() -> Checkpoint {
-    use burn::backend::NdArray;
     use burn_store::{ModuleSnapshot, SafetensorsStore};
 
-    let device = Default::default();
+    let device = cpu();
     let config = toy_body_config();
-    let body = config.init::<NdArray<f32>>(&device);
+    let body = config.init(&device);
 
     let mut store = SafetensorsStore::from_bytes(None);
     body.save_into(&mut store).expect("toy body should save");
@@ -170,15 +182,14 @@ pub fn toy_bundle(classifier: burn_setfit::config::ClassifierConfig) -> Vec<u8> 
 }
 
 fn train_toy_bundle(classifier: burn_setfit::config::ClassifierConfig) -> Vec<u8> {
-    use burn::backend::{Autodiff, NdArray};
     use burn_setfit::train::Trainer;
 
-    let mut trainer = Trainer::<Autodiff<NdArray<f32>>>::new(
+    let mut trainer = Trainer::new(
         &toy_checkpoint(),
         classifier,
         separable_examples(),
         fast_train_config(),
-        Default::default(),
+        cpu(),
     )
     .expect("toy training data is well formed");
     trainer.fit_with(|_| {}).expect("toy training completes");

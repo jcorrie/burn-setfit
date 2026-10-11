@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-148 tests, about two seconds, no network. Stay in this loop. Anything touching
+151 tests, about two seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -90,6 +90,23 @@ test names are given so a failure is self-explaining.
   `tests/bundle.rs::a_manifest_whose_windows_outrun_the_position_table_is_refused`,
   `tests/train.rs::a_sequence_budget_beyond_the_bodys_positions_is_rejected_before_training`.
 
+- **`Device::default()` is whichever backend the build happens to have.** Since
+  Burn 0.22 the backend is a runtime value, not a type parameter, and the default
+  prefers a GPU whenever `wgpu` is compiled in. A test written against the
+  default runs on `ndarray` in the main loop and silently moves to wgpu under
+  `--features wgpu` — including the reference side of `tests/wgpu.rs`. Tests name
+  their device: `common::cpu()`, and `gpu()` in `tests/wgpu.rs`.
+
+- **Burn's GELU backward calls `tanh`, and Metal's `tanh` is NaN past ~43.**
+  The backward is the tanh *approximation's* derivative, whose argument passes
+  43 for pre-activations above ~9. cubecl guards it only under
+  `cfg(target_os = "macos")` — the Rust target — so wasm in a browser on a Mac,
+  which reaches Metal through WebGPU, is unguarded, and one GPU training step
+  turned MiniLM's weights to NaN in excel-embed. `src/minilm/encoder.rs` owns the
+  encoder stack (same parameter paths as Burn's `TransformerEncoder`) so GELU can
+  be built from `erf`. Do not swap Burn's `TransformerEncoder` or `Gelu` back in.
+  Guard: `minilm::encoder::tests::gelu_gradient_is_exact_and_finite_where_tanh_was_not`.
+
 - **Seeded runs reproduce weights, not bytes.** Burn writes the safetensors
   `__metadata__` map in `HashMap` order. Compare tensors, never file hashes.
 
@@ -99,7 +116,7 @@ test names are given so a failure is self-explaining.
 
 - **`Tensor::into_data()` is a panic on wasm with a GPU backend.** It polls the
   read future once and gives up; a browser cannot block on a buffer map, so the
-  future is always pending there. Lazy `WgpuDevice` acquisition goes through the
+  future is always pending there. Lazy wgpu device acquisition goes through the
   same `block_on`, which is why the trap lands while a tensor is being *built*,
   before any readback, and reports only `unreachable`. Every readback therefore
   goes through `src/readback.rs`, and the `_async` methods are the real

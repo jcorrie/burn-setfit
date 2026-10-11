@@ -9,7 +9,7 @@
 use crate::error::{Result, SetFitError};
 use crate::minilm::{MiniLmConfig, MiniLmModel, MiniLmVariant, Naming, load_weights};
 use crate::tokenize::Tokenizer;
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 
 /// Everything needed to start from a pretrained body.
 ///
@@ -103,7 +103,7 @@ impl Checkpoint {
     }
 
     /// Initialise a body and load the weights into it.
-    pub fn body<B: Backend>(&self, device: &B::Device) -> Result<MiniLmModel<B>> {
+    pub fn body(&self, device: &Device) -> Result<MiniLmModel> {
         let mut model = self.config.init(device);
         load_weights(&mut model, self.weights.clone(), self.naming)?;
         Ok(model)

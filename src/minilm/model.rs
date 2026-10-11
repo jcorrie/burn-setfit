@@ -1,13 +1,10 @@
 use super::embedding::{MiniLmEmbeddings, MiniLmEmbeddingsConfig};
+use super::encoder::{MiniLmEncoder, MiniLmEncoderConfig};
 use crate::error::SetFitError;
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::Initializer::KaimingUniform;
-use burn::nn::transformer::{
-    TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput,
-};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Int, Tensor};
+use burn::tensor::{Bool, Device, Int, Tensor};
 
 /// MiniLM model configuration.
 ///
@@ -38,23 +35,23 @@ pub struct MiniLmConfig {
 ///
 /// A BERT-based encoder optimized for sentence embeddings.
 #[derive(Module, Debug)]
-pub struct MiniLmModel<B: Backend> {
+pub struct MiniLmModel {
     /// Token embeddings (word + position + token_type).
-    pub embeddings: MiniLmEmbeddings<B>,
+    pub embeddings: MiniLmEmbeddings,
     /// Transformer encoder stack.
-    pub encoder: TransformerEncoder<B>,
+    pub encoder: MiniLmEncoder,
 }
 
 /// Output from the MiniLM model.
 #[derive(Debug, Clone)]
-pub struct MiniLmOutput<B: Backend> {
+pub struct MiniLmOutput {
     /// Hidden states from the last encoder layer [batch_size, seq_len, hidden_size].
-    pub hidden_states: Tensor<B, 3>,
+    pub hidden_states: Tensor<3>,
 }
 
 impl MiniLmConfig {
     /// Initialize model with default (random) weights.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> MiniLmModel<B> {
+    pub fn init(&self, device: &Device) -> MiniLmModel {
         let embeddings = self.embeddings_config().init(device);
         let encoder = self.encoder_config().init(device);
 
@@ -84,24 +81,25 @@ impl MiniLmConfig {
         )
     }
 
-    fn encoder_config(&self) -> TransformerEncoderConfig {
-        TransformerEncoderConfig::new(
+    fn encoder_config(&self) -> MiniLmEncoderConfig {
+        // BERT-style post-LayerNorm, plain softmax: what Burn's
+        // `TransformerEncoder` was configured as before this crate took the
+        // stack over (see `encoder.rs` for why it did).
+        MiniLmEncoderConfig::new(
             self.hidden_size,
             self.intermediate_size,
             self.num_attention_heads,
             self.num_hidden_layers,
+            self.hidden_dropout_prob,
+            KaimingUniform {
+                gain: 1.0 / 3.0f64.sqrt(),
+                fan_out_only: false,
+            },
         )
-        .with_dropout(self.hidden_dropout_prob)
-        .with_norm_first(false) // BERT-style post-LayerNorm
-        .with_quiet_softmax(false)
-        .with_initializer(KaimingUniform {
-            gain: 1.0 / 3.0f64.sqrt(),
-            fan_out_only: false,
-        })
     }
 }
 
-impl<B: Backend> MiniLmModel<B> {
+impl MiniLmModel {
     /// Width of the sentence embeddings this body produces.
     ///
     /// Read from the weights rather than assumed, so a head can be sized to any
@@ -121,10 +119,10 @@ impl<B: Backend> MiniLmModel<B> {
     /// Hidden states from the last encoder layer.
     pub fn forward(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Tensor<B, 2>,
-        token_type_ids: Option<Tensor<B, 2, Int>>,
-    ) -> MiniLmOutput<B> {
+        input_ids: Tensor<2, Int>,
+        attention_mask: Tensor<2>,
+        token_type_ids: Option<Tensor<2, Int>>,
+    ) -> MiniLmOutput {
         // Get embeddings
         let embeddings = self.embeddings.forward(input_ids, token_type_ids);
 
@@ -132,12 +130,11 @@ impl<B: Backend> MiniLmModel<B> {
         // attention_mask: 1 = real, 0 = padding
         // mask_pad: true = padding, false = real
         let device = attention_mask.device();
-        let zeros = Tensor::<B, 2>::zeros(attention_mask.shape(), &device);
-        let mask_pad: Tensor<B, 2, Bool> = attention_mask.equal(zeros);
+        let zeros = Tensor::<2>::zeros(attention_mask.shape(), &device);
+        let mask_pad: Tensor<2, Bool> = attention_mask.equal(zeros);
 
         // Forward through encoder
-        let encoder_input = TransformerEncoderInput::new(embeddings).mask_pad(mask_pad);
-        let hidden_states = self.encoder.forward(encoder_input);
+        let hidden_states = self.encoder.forward(embeddings, mask_pad);
 
         MiniLmOutput { hidden_states }
     }

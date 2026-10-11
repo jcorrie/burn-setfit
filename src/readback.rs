@@ -23,7 +23,6 @@
 //! reads a tensor, kept in step by hand.
 
 use crate::error::{Result, SetFitError};
-use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, try_read_sync};
 use core::future::Future;
 
@@ -50,16 +49,16 @@ pub(crate) fn blocking<T>(what: &str, fut: impl Future<Output = Result<T>>) -> R
 ///
 /// The one place a `TensorData` conversion failure is turned into an error, so
 /// callers deal in `Vec<f32>` and not in two failure modes.
-pub(crate) async fn floats<B: Backend, const D: usize>(t: Tensor<B, D>) -> Result<Vec<f32>> {
+pub(crate) async fn floats<const D: usize>(t: Tensor<D>) -> Result<Vec<f32>> {
     t.into_data_async()
         .await
         .map_err(|e| SetFitError::Readback(format!("reading a tensor from the device: {e}")))?
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .map_err(|e| SetFitError::Store(format!("{e:?}")))
 }
 
 /// Bring a one-element tensor back to the host.
-pub(crate) async fn scalar<B: Backend>(t: Tensor<B, 1>) -> Result<f32> {
+pub(crate) async fn scalar(t: Tensor<1>) -> Result<f32> {
     Ok(floats(t)
         .await?
         .first()

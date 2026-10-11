@@ -19,17 +19,19 @@
 
 mod common;
 
-use burn::backend::wgpu::Wgpu;
-use burn::backend::{Autodiff, NdArray};
+use burn::tensor::{Device, DeviceKind};
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::infer::Classifier;
 use burn_setfit::train::Trainer;
 use common::{
-    fast_train_config, separable_examples, small_chunking, toy_bundle, toy_checkpoint, words,
+    cpu, fast_train_config, separable_examples, small_chunking, toy_bundle, toy_checkpoint, words,
 };
 
-type Cpu = NdArray<f32>;
-type Gpu = Wgpu;
+/// The wgpu device. Named, like [`cpu`], because with both features compiled in
+/// a defaulted device is whichever backend Burn prefers, not the one under test.
+fn gpu() -> Device {
+    Device::wgpu(DeviceKind::DefaultDevice)
+}
 
 /// Where two backends may legitimately differ: summation order, mostly.
 const TOL: f32 = 1e-3;
@@ -54,11 +56,10 @@ fn a_tensor_survives_a_round_trip_through_the_device() {
     // The cheapest possible failure to diagnose: if this fails, no adapter was
     // available and every other failure in this file is a consequence.
     use burn::tensor::Tensor;
-    let device = Default::default();
-    let t = Tensor::<Gpu, 1>::from_data([1.0f32, 2.0, 3.0], &device);
+    let t = Tensor::<1>::from_data([1.0f32, 2.0, 3.0], &gpu());
     let out = (t.clone() * t)
         .into_data()
-        .into_vec::<f32>()
+        .try_into_vec::<f32>()
         .expect("floats");
     assert_close(&out, &[1.0, 4.0, 9.0], "elementwise square");
 }
@@ -70,8 +71,8 @@ fn classifying_on_wgpu_agrees_with_ndarray() {
     let bundle = toy_bundle(config());
     let text = words(200);
 
-    let cpu = Classifier::<Cpu>::from_bundle(&bundle, Default::default()).expect("loads on cpu");
-    let gpu = Classifier::<Gpu>::from_bundle(&bundle, Default::default()).expect("loads on wgpu");
+    let cpu = Classifier::from_bundle(&bundle, cpu()).expect("loads on cpu");
+    let gpu = Classifier::from_bundle(&bundle, gpu()).expect("loads on wgpu");
 
     let want = cpu.classify(&text).expect("classifies on cpu");
     let got = gpu.classify(&text).expect("classifies on wgpu");
@@ -86,8 +87,8 @@ fn embedding_on_wgpu_agrees_with_ndarray() {
     let bundle = toy_bundle(config());
     let texts = ["a b c", "x y z"];
 
-    let cpu = Classifier::<Cpu>::from_bundle(&bundle, Default::default()).expect("loads on cpu");
-    let gpu = Classifier::<Gpu>::from_bundle(&bundle, Default::default()).expect("loads on wgpu");
+    let cpu = Classifier::from_bundle(&bundle, cpu()).expect("loads on cpu");
+    let gpu = Classifier::from_bundle(&bundle, gpu()).expect("loads on wgpu");
 
     let want = cpu.embed(&texts).expect("embeds on cpu");
     let got = gpu.embed(&texts).expect("embeds on wgpu");
@@ -104,12 +105,12 @@ fn training_on_wgpu_learns_the_task() {
     // through the optimiser once their gradients differ in the last bits, and
     // demanding they not is a test that fails for the wrong reason. What must
     // hold is that training on wgpu produces a model that works.
-    let mut trainer = Trainer::<Autodiff<Gpu>>::new(
+    let mut trainer = Trainer::new(
         &toy_checkpoint(),
         config(),
         separable_examples(),
         fast_train_config(),
-        Default::default(),
+        gpu(),
     )
     .expect("toy training data is well formed");
 
@@ -128,8 +129,7 @@ fn training_on_wgpu_learns_the_task() {
 
     // The two classes have disjoint vocabularies, so a model that trained at
     // all separates them.
-    let classifier =
-        Classifier::<Gpu>::from_bundle(&bundle, Default::default()).expect("loads on wgpu");
+    let classifier = Classifier::from_bundle(&bundle, gpu()).expect("loads on wgpu");
     let alpha = classifier.classify("a b c").expect("classifies");
     let beta = classifier.classify("x y z").expect("classifies");
     assert_ne!(
