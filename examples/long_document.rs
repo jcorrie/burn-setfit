@@ -8,7 +8,8 @@
 //! Run with: `cargo run --release --example long_document`
 use burn_setfit::checkpoint::Checkpoint;
 use burn_setfit::config::ClassifierConfig;
-use burn_setfit::infer::Classifier;
+use burn_setfit::head::TaskMode;
+use burn_setfit::infer::{Classifier, decode_against_background};
 use burn_setfit::minilm::MiniLmVariant;
 use burn_setfit::reduce::Reducer;
 use burn_setfit::train::{Example, TrainConfig, Trainer};
@@ -89,6 +90,7 @@ fn evaluate(
     fanout: Option<usize>,
     signal_doc: &str,
     control_doc: &str,
+    background: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut classifier = Classifier::from_bundle(bundle, Default::default())?.with_reducer(reducer);
     if let Some(f) = fanout {
@@ -109,11 +111,42 @@ fn evaluate(
         "  separation:                                             {:+.3}",
         signal_score - control_score
     );
+    let task = classifier.manifest().task();
+    let names = classifier.labels();
+    let decode = |scores: &[f32]| -> Vec<&str> {
+        decode_against_background(scores, task, background)
+            .into_iter()
+            .map(|i| names[i].as_str())
+            .collect()
+    };
     println!(
         "  predicted: {:?}   control predicted: {:?}",
-        with_signal.labels(classifier.manifest()),
-        control.labels(classifier.manifest())
+        decode(&with_signal.scores),
+        decode(&control.scores)
     );
+
+    // Calibration (#12): which multi-label thresholds would get both documents
+    // right — billing for the signal document, not for the control? With a
+    // background class, billing must also beat it.
+    if let TaskMode::MultiLabel { threshold } = task {
+        let (s, c) = (signal_score, control_score);
+        let floors = background.map(|b| (with_signal.scores[b], control.scores[b]));
+        if let Some((sf, cf)) = floors {
+            println!("  background score, signal / control:                     {sf:.3} / {cf:.3}");
+        }
+        let window = match floors {
+            Some((sf, _)) if s <= sf => None,
+            Some((_, cf)) if c <= cf => Some((0.0, s)),
+            _ if s > c => Some((c, s)),
+            _ => None,
+        };
+        match window {
+            Some((lo, hi)) => println!(
+                "  thresholds that get both right: above {lo:.3}, up to {hi:.3} (current {threshold})"
+            ),
+            None => println!("  no threshold gets both right (current {threshold})"),
+        }
+    }
 
     // A chunk is ~256 tokens, so roughly a thousand characters: report whether
     // the winning chunk actually contains the planted signal rather than
@@ -160,6 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         &signal_doc,
         &control_doc,
+        None,
     )?;
 
     eprintln!("training multi-label ...");
@@ -180,7 +214,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(8),
         ),
     ] {
-        evaluate(name, &multi, reducer, fanout, &signal_doc, &control_doc)?;
+        evaluate(
+            name,
+            &multi,
+            reducer,
+            fanout,
+            &signal_doc,
+            &control_doc,
+            None,
+        )?;
     }
 
     eprintln!("training multi-label with a background class ...");
@@ -192,7 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bg = train(
         &checkpoint,
         ClassifierConfig::new(["billing", "outage", "feature", "other"]).multi_label(),
-        bg_examples.clone(),
+        bg_examples,
     )?;
     evaluate(
         "MULTI-LABEL + background class, MaxLogits",
@@ -201,28 +243,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         &signal_doc,
         &control_doc,
+        None,
     )?;
 
     // The same model and the same scores, decoded differently. Above, "other"
-    // is a label like any other and the verdict is still "is billing above
-    // 0.5?" — which the row above answers badly, because that configuration
-    // separates well and calibrates poorly. Naming it the background class
-    // changes the question to "is billing above other?", which is what the
-    // separation actually measures.
-    let bg_declared = train(
-        &checkpoint,
-        ClassifierConfig::new(["billing", "outage", "feature", "other"])
-            .multi_label()
-            .with_background_class("other")?,
-        bg_examples,
-    )?;
+    // is a label like any other and the verdict is still "is billing above the
+    // threshold?". Decoding against it as the background class changes the
+    // question to "is billing above the threshold *and* above other?". One
+    // model, so the two rows differ only in decoding (training it twice would
+    // compare two models).
     evaluate(
         "MULTI-LABEL + background class DECODED AS ONE, MaxLogits",
-        &bg_declared,
+        &bg,
         Reducer::MaxLogits,
         None,
         &signal_doc,
         &control_doc,
+        Some(3),
     )?;
 
     Ok(())
