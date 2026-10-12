@@ -149,6 +149,11 @@ jobs:
         run: node run.mjs
         env:
           BROWSER: ${{ matrix.engine }}
+          # The worst main-thread stall allowed while training. 250 ms is
+          # Chromium's; WebKit's wasm is slower, and its body-to-head
+          # transition step measured 354 ms on a shared runner. Either budget
+          # still fails a trainer that stopped yielding between steps.
+          FRAME_GAP_BUDGET_MS: ${{ matrix.engine == 'webkit' && '750' || '250' }}
 
   pretrained:
     name: published MiniLM matrix
