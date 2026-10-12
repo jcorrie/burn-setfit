@@ -63,6 +63,11 @@ wasm builds, the wgpu suite on lavapipe, the browser harness, and the
 job, "CI passed", rolls them up for branch protection. A command added to the
 loop above belongs in the workflow too.
 
+`.github/workflows/measure.yml` runs `examples/quantize.rs` and
+`examples/long_document.rs` on the real checkpoint, which this sandbox cannot
+download: from the Actions tab (Measure → Run workflow), or by giving a PR the
+`measure` label. The output lands on the run's summary page.
+
 ## Things that will bite
 
 These are all mistakes already made once here. Each is guarded by a test; the
