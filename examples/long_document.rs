@@ -148,6 +148,41 @@ fn evaluate(
         }
     }
 
+    // With a background class, also decode each chunk on its own. A
+    // document-level comparison pits billing's best chunk against the
+    // background's best chunk, and a long document is mostly filler, so the
+    // background's best is high in every document. Per chunk, billing only
+    // has to beat the background where the billing sentence actually is.
+    if background.is_some() {
+        let votes = |doc: &str| -> Result<(usize, usize), Box<dyn std::error::Error>> {
+            let chunks = classifier.classify_chunks(doc)?;
+            let billing = chunks
+                .iter()
+                .filter(|c| decode_against_background(&c.scores, task, background).contains(&0))
+                .count();
+            Ok((billing, chunks.len()))
+        };
+        let (sb, sn) = votes(signal_doc)?;
+        let (cb, cn) = votes(control_doc)?;
+        println!("  chunks that decode to billing, signal / control:        {sb}/{sn} / {cb}/{cn}");
+        // The direct test of per-chunk competition: in each document's most
+        // billing-like chunk, does billing beat the background?
+        let b = background.unwrap_or(0);
+        let strongest = |doc: &str| -> Result<(f32, f32), Box<dyn std::error::Error>> {
+            let chunks = classifier.classify_chunks(doc)?;
+            let best = chunks
+                .iter()
+                .max_by(|x, y| x.scores[0].total_cmp(&y.scores[0]))
+                .ok_or("no chunks")?;
+            Ok((best.scores[0], best.scores[b]))
+        };
+        let (s_bill, s_bg) = strongest(signal_doc)?;
+        let (c_bill, c_bg) = strongest(control_doc)?;
+        println!(
+            "  most billing-like chunk, billing vs background:         signal {s_bill:.3} vs {s_bg:.3}, control {c_bill:.3} vs {c_bg:.3}"
+        );
+    }
+
     // A chunk is ~256 tokens, so roughly a thousand characters: report whether
     // the winning chunk actually contains the planted signal rather than
     // printing its first line and guessing.
