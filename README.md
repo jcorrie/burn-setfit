@@ -287,17 +287,33 @@ let config = ClassifierConfig::new(["billing", "outage", "feature", "other"])
 On long documents it predicts nothing for either one, and the example's
 diagnostics show why. Under `MaxLogits` the background's document score is its
 best chunk's, and a long document is mostly filler, so *other* scores 0.79 in
-both. Nor does comparing chunk by chunk rescue it: in the signal document's most
-billing-like chunk, billing scores 0.39 against *other*'s 0.61, and no chunk in
-either document decodes to billing. The billing sentence is one of roughly ten
-in its 256-token window, so the window as a whole really is mostly *other*.
+both. Nor does comparing chunk by chunk rescue it at the default window: in the
+signal document's most billing-like chunk, billing scores 0.39 against
+*other*'s 0.61. The billing sentence is one of roughly ten in its 256-token
+window, so that window really is mostly *other*.
 
-The decision rule itself is exact and pinned by `tests/background.rs`, and it
-does what it says: it gives a single-label head somewhere to abstain *to*, and
-it suits inputs whose chunks are mostly on-topic. It is not a fix for a single
-sentence in a long document. That needs either a calibrated threshold, as
-above, or windows small enough that the sentence is not diluted, which has not
-been measured.
+Narrower windows remove the dilution. The same trained model, repacked to read
+in smaller windows (windowing happens only at inference):
+
+| Windows | Billing chunk: billing vs *other* | Control's most billing-like chunk | Chunks that decode to billing, signal / control |
+| ------- | --------------------------------- | --------------------------------- | ----------------------------------------------- |
+| 256     | 0.40 vs 0.59                      | 0.17 vs 0.76                      | 0 / 12 — 0 / 12                                 |
+| 128     | 0.39 vs 0.57                      | 0.11 vs 0.80                      | 0 / 27 — 0 / 27                                 |
+| **64**  | **0.66 vs 0.39**                  | 0.11 vs 0.88                      | **2 / 61 — 0 / 60**                             |
+
+At 64 tokens, deciding *per chunk* against the background gets both documents
+right at the default threshold, and without any calibration. The
+document-level decode this crate implements still predicts nothing there
+(*other*'s best chunk scores 0.91), so the working rule — "a label is predicted
+if some chunk prefers it to the background" — is not yet a decode mode; until
+it is, `classify_chunks` plus `decode_against_background` per chunk does it by
+hand. Plain multi-label `MaxLogits` also separates better at 64 tokens (+0.33
+against +0.19 at 256), with a wider threshold window (0.57 – 0.90).
+
+The decision rule itself is exact and pinned by `tests/background.rs`. It gives a
+single-label head somewhere to abstain *to*, and it suits inputs whose chunks
+are mostly on-topic. One sentence in a long document needs small windows and a
+per-chunk decision, or a calibrated threshold.
 
 ### Per-chunk output
 

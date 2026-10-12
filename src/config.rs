@@ -152,7 +152,10 @@ impl ClassifierConfig {
     /// threshold, and measured on the real checkpoint it does *not* fix that
     /// case: one relevant sentence in a 256-token window leaves the window
     /// mostly background, so the background wins everywhere (README, "Why the
-    /// background class does not help here"). Calibrate the threshold instead.
+    /// background class does not help here"). Calibrate the threshold, or
+    /// read in small windows and decide per chunk with
+    /// [`decode_against_background`](crate::infer::decode_against_background)
+    /// over [`classify_chunks`](crate::infer::Classifier::classify_chunks).
     /// It does suit inputs whose chunks are mostly on-topic.
     ///
     /// It also gives a single-label head somewhere to abstain *to*. A softmax
