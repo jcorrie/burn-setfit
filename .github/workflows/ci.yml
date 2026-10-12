@@ -1,0 +1,173 @@
+# Runs on pull requests only: opening one, pushing to its branch, reopening it.
+# Not on pushes to main or on merge — a PR has already been through this by
+# then. `workflow_dispatch` is there to re-run by hand from the Actions tab.
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR supersedes the run still going for the previous one.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The features the main loop runs under (CLAUDE.md, "The loop").
+  FEATURES: ndarray,train,native
+
+jobs:
+  lint:
+    name: fmt, clippy, docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lint
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --features $FEATURES -- -D warnings
+      # Broken intra-doc links have reached main once already.
+      - run: cargo doc --locked --no-deps --features $FEATURES
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: tests (ndarray)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      # Unit, integration and doc tests; also compiles every example.
+      - run: cargo test --locked --workspace --features $FEATURES
+
+  msrv:
+    name: MSRV (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep in step with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo check --locked --workspace --all-targets --features $FEATURES
+
+  wasm:
+    name: wasm32 builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+      # Both must keep building: that is the point of the crate.
+      - name: ndarray
+        run: cargo build --locked --target wasm32-unknown-unknown --no-default-features --features ndarray,train
+      # The one configuration where a blocking readback is a failure, not a slow path.
+      - name: wgpu-wasm-unverified
+        run: cargo build --locked --target wasm32-unknown-unknown --no-default-features --features wgpu-wasm-unverified,train
+      - name: setfit-wasm (release)
+        run: cargo build --locked --release --target wasm32-unknown-unknown -p setfit-wasm
+
+  wgpu:
+    name: tests (wgpu on lavapipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Mesa's software Vulkan. Exercises the whole wgpu backend — codegen,
+      # dispatch, readback — without a GPU. Proves nothing about real hardware.
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-tools
+          vulkaninfo --summary
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wgpu
+      - run: cargo test --locked --features ndarray,wgpu,train --test wgpu
+
+  browser:
+    name: browser harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: browser
+      - name: Build setfit-wasm
+        run: cargo build --locked --release --target wasm32-unknown-unknown -p setfit-wasm
+      # The CLI must be exactly the version the wasm-bindgen crate resolved to.
+      - name: Read wasm-bindgen version
+        id: bindgen
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
+      - name: Generate bindings and toy checkpoint
+        run: |
+          wasm-bindgen --target web --out-dir browser-test/public/pkg \
+            target/wasm32-unknown-unknown/release/setfit_wasm.wasm
+          python3 browser-test/make_toy_checkpoint.py browser-test/public/checkpoint
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: browser-test/package-lock.json
+      - name: Install Playwright Chromium
+        working-directory: browser-test
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run harness
+        working-directory: browser-test
+        run: node run.mjs
+
+  pretrained:
+    name: published MiniLM matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pretrained
+      # ~90 MB from HuggingFace; the checkpoint never changes, so cache it.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/burn-models
+          key: minilm-checkpoints-v1
+      # Ground truth for anything touching src/minilm/, tokenization or pooling:
+      # the published all-MiniLM-L6-v2 similarity matrix.
+      - run: cargo test --locked --release --features $FEATURES --test pretrained -- --ignored
+
+  # One check to mark as required in branch protection, instead of seven.
+  ci-ok:
+    name: CI passed
+    if: always()
+    needs: [lint, test, msrv, wasm, wgpu, browser, pretrained]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs succeeded
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'

@@ -16,8 +16,10 @@ python3 browser-test/make_toy_checkpoint.py browser-test/public/checkpoint
 cd browser-test && npm install && node run.mjs
 ```
 
-`npm install` needs `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` where Chromium is
-already provided; `run.mjs` takes the binary from `CHROME_PATH`.
+`run.mjs` uses the Chromium at `CHROME_PATH` if set, then the one preinstalled
+in Claude's sandbox, and otherwise Playwright's own — run
+`npx playwright install chromium` once for that. CI (`.github/workflows/ci.yml`)
+does exactly the steps above.
 
 ## The toy checkpoint
 

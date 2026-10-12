@@ -6,12 +6,16 @@
 
 import { chromium } from 'playwright';
 import { createServer } from 'node:http';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), 'public');
-const CHROME = process.env.CHROME_PATH ?? '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+// CHROME_PATH wins; then the sandbox's preinstalled Chromium; otherwise whatever
+// `npx playwright install chromium` put in place (CI does that).
+const SANDBOX_CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+const CHROME = process.env.CHROME_PATH ?? (existsSync(SANDBOX_CHROME) ? SANDBOX_CHROME : undefined);
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS ?? 180_000);
 
 const MIME = {

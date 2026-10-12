@@ -54,6 +54,15 @@ slow one, so it catches an `into_data()` that crept back in. It has never been
 executed on a GPU — the feature's name is load-bearing, do not rename it to
 something reassuring.
 
+## CI
+
+`.github/workflows/ci.yml` runs every command above on each pull request (not
+on pushes to `main`): fmt/clippy/docs, the main loop, an MSRV check, the three
+wasm builds, the wgpu suite on lavapipe, the browser harness, and the
+`--ignored` published-matrix check, which GitHub's runners *can* download. One
+job, "CI passed", rolls them up for branch protection. A command added to the
+loop above belongs in the workflow too.
+
 ## Things that will bite
 
 These are all mistakes already made once here. Each is guarded by a test; the
