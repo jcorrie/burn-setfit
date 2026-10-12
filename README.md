@@ -356,6 +356,25 @@ throughout, which is the entire reason `Trainer` is a step-wise state machine
 rather than a `fit()` loop. The 133 ms outlier is the body-to-head transition,
 which embeds the whole training set inside one `step()`.
 
+**Those numbers are the toy checkpoint's.** The Measure workflow runs the same
+harness on the real `all-MiniLM-L6-v2` (Chromium, single-threaded wasm,
+`ndarray`):
+
+| | Toy | Real MiniLM-L6 |
+| --- | --- | --- |
+| 26 training steps | 515 ms | 9.2 s |
+| median main-thread frame gap during training | 17 ms | 17 ms |
+| **worst main-thread frame gap** | 133 ms | **3.0 s** |
+| classify a ~2 KB document (5 chunks) | 79 ms | 3.3 s |
+| held-in examples correct | 12 / 12 | 12 / 12 |
+| bundle | 146 KB | 90.7 MB |
+
+It trains and classifies correctly at full size, but stepping once per frame
+does not keep a page responsive there: one contrastive step through the full
+body stalls the main thread for seconds. **Train in a Web Worker**, as
+excel-embed does, and drive `step()` from there; the step-wise API still matters,
+since it is what lets a worker report progress and be cancelled between steps.
+
 The `tokenizers` rayon worry that shaped `src/tokenize.rs` looks unfounded on
 this evidence — the single-sequence `encode` path runs fine in a browser. That
 is not a licence to reach for `encode_batch`, which remains untested there.
@@ -389,7 +408,7 @@ non-event: weights are expanded back to `f32` before Burn sees them, so the
 model computes identically on every backend — see [Quantization](#quantization)
 for what it costs.
 
-Training yields between steps, so a browser stays responsive:
+Training yields between steps. With the real model a step takes seconds, so run this loop in a Web Worker (see above); the main thread then only renders progress:
 
 ```js
 const trainer = new Trainer(configJson, weights, tokenizerJson, request);
