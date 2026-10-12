@@ -4,7 +4,7 @@
 // the checkpoint), drives it in Chromium, and exits non-zero if anything the
 // page asserts came back wrong.
 
-import { chromium } from 'playwright';
+import { chromium, webkit } from 'playwright';
 import { createServer } from 'node:http';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -16,6 +16,9 @@ const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), 'public');
 // `npx playwright install chromium` put in place (CI does that).
 const SANDBOX_CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const CHROME = process.env.CHROME_PATH ?? (existsSync(SANDBOX_CHROME) ? SANDBOX_CHROME : undefined);
+// BROWSER=webkit runs the same page in Playwright's WebKit, the engine behind
+// Safari and Excel for Mac (`npx playwright install webkit` first).
+const ENGINE = process.env.BROWSER ?? 'chromium';
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS ?? 180_000);
 
 const MIME = {
@@ -44,7 +47,11 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const url = `http://127.0.0.1:${server.address().port}/`;
 console.log(`serving ${ROOT} at ${url}`);
 
-const browser = await chromium.launch({ executablePath: CHROME });
+const browser =
+  ENGINE === 'webkit'
+    ? await webkit.launch()
+    : await chromium.launch({ executablePath: CHROME });
+console.log(`engine: ${ENGINE} ${browser.version()}`);
 const page = await browser.newPage();
 
 const consoleErrors = [];

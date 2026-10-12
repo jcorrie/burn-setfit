@@ -103,8 +103,13 @@ jobs:
       - run: cargo test --locked --features ndarray,wgpu,train --test wgpu
 
   browser:
-    name: browser harness
+    name: browser harness (${{ matrix.engine }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # WebKit is the engine behind Safari and Excel for Mac.
+        engine: [chromium, webkit]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -134,14 +139,16 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: browser-test/package-lock.json
-      - name: Install Playwright Chromium
+      - name: Install Playwright ${{ matrix.engine }}
         working-directory: browser-test
         run: |
           npm ci
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps ${{ matrix.engine }}
       - name: Run harness
         working-directory: browser-test
         run: node run.mjs
+        env:
+          BROWSER: ${{ matrix.engine }}
 
   pretrained:
     name: published MiniLM matrix

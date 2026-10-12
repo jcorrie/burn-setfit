@@ -21,6 +21,10 @@ in Claude's sandbox, and otherwise Playwright's own — run
 `npx playwright install chromium` once for that. CI (`.github/workflows/ci.yml`)
 does exactly the steps above.
 
+`BROWSER=webkit node run.mjs` runs the same page in Playwright's WebKit, the
+engine behind Safari and Excel for Mac (`npx playwright install webkit` first).
+CI runs both engines.
+
 ## The toy checkpoint
 
 `make_toy_checkpoint.py` writes the three files a real HuggingFace checkpoint
