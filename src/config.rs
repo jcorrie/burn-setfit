@@ -146,13 +146,14 @@ impl ClassifierConfig {
     /// model can *predict*. Instead it becomes the bar every other label has to
     /// clear.
     ///
-    /// This is aimed at the failure measured in
-    /// [#4](https://github.com/jcorrie/burn-setfit/issues/4): over a long
-    /// document, a configuration can separate signal from filler well and still
-    /// decide wrongly, because the absolute scores sit on the wrong side of a
-    /// fixed threshold. Comparing against a background class asks the question
-    /// the separation actually answers — "is this label stronger than nothing in
-    /// particular?" — instead of "is this label above 0.5?".
+    /// Comparing against a background class asks "is this label stronger than
+    /// nothing in particular?" instead of "is this label above 0.5?". It was
+    /// aimed at long documents, where scores sit on the wrong side of a fixed
+    /// threshold, and measured on the real checkpoint it does *not* fix that
+    /// case: one relevant sentence in a 256-token window leaves the window
+    /// mostly background, so the background wins everywhere (README, "Why the
+    /// background class does not help here"). Calibrate the threshold instead.
+    /// It does suit inputs whose chunks are mostly on-topic.
     ///
     /// It also gives a single-label head somewhere to abstain *to*. A softmax
     /// over real classes cannot say "none"; a softmax whose argmax lands on the

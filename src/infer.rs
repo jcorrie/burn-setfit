@@ -596,9 +596,9 @@ pub fn decode(scores: &[f32], task: TaskMode) -> Vec<usize> {
 /// a label counts only if it is stronger than "nothing in particular".
 ///
 /// - **Multi-label** — a label must clear the threshold *and* outscore the
-///   background. The second test is the one that matters over long documents,
-///   where scores compress toward the middle and a fixed threshold stops
-///   discriminating long before the ordering does.
+///   background. Note the comparison is made on reduced scores; on a long
+///   document the background's best chunk is high whatever else the document
+///   says, so this rarely helps there (see the README's long-document section).
 /// - **Single-label** — the argmax still wins, but if it *is* the background
 ///   class the document predicts nothing. That is how a softmax abstains: not by
 ///   scoring low, which it cannot do, but by having somewhere to put the mass.

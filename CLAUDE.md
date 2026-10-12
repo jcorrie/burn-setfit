@@ -217,8 +217,10 @@ the published matrix.
 
 ## Open work
 
-See [issues](https://github.com/jcorrie/burn-setfit/issues). #1 is now half
-answered — `browser-test/` proves the wasm trains and classifies in a browser,
-but only against a toy checkpoint; the real model has never been fetched into a
-page. #2 (quantize the 86.5 MB bundle) is the other one that matters; the rest
-are smaller or speculative.
+See [issues](https://github.com/jcorrie/burn-setfit/issues). #12 holds what
+needs the real checkpoint. Its first two items now run on CI (the `--ignored`
+matrix check on every PR, quantization through the Measure workflow). What
+remains is long documents: a fixed threshold needs calibrating per model, and
+the background class cannot be compared at document level (see the README's
+long-document section). And the real model has still never been fetched into
+the browser harness.
