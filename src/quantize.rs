@@ -107,10 +107,8 @@ fn store_err(e: impl core::fmt::Display) -> SetFitError {
 
 /// Read an `f32` tensor's data. Safetensors is little-endian on the wire.
 fn f32_data(view: &TensorView<'_>) -> Vec<f32> {
-    view.data()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+    let (words, _) = view.data().as_chunks::<4>();
+    words.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 /// One tensor, ready to be handed back to `safetensors::serialize`.
@@ -265,8 +263,9 @@ pub(crate) fn expand(weights: &[u8]) -> Result<Vec<u8>> {
         let restored = match view.dtype() {
             Dtype::F16 => {
                 let mut data = Vec::with_capacity(view.data().len() * 2);
-                for b in view.data().chunks_exact(2) {
-                    let h = f16::from_le_bytes([b[0], b[1]]);
+                let (halves, _) = view.data().as_chunks::<2>();
+                for b in halves {
+                    let h = f16::from_le_bytes(*b);
                     data.extend_from_slice(&h.to_f32().to_le_bytes());
                 }
                 Owned {

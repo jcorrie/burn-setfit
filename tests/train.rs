@@ -453,11 +453,9 @@ fn a_partially_trained_model_can_still_be_inspected_deliberately() {
 /// Fingerprint a model by summing each parameter tensor, keyed by path.
 /// Sum a collected `f32` tensor's elements, read from its little-endian bytes.
 fn f32_sum(t: &burn_store::burn_pack::Tensor) -> f32 {
-    t.to_bytes()
-        .expect("tensor bytes")
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .sum()
+    let bytes = t.to_bytes().expect("tensor bytes");
+    let (words, _) = bytes.as_chunks::<4>();
+    words.iter().map(|b| f32::from_le_bytes(*b)).sum()
 }
 
 fn weights_of(bundle: &[u8]) -> Vec<(String, f32)> {
