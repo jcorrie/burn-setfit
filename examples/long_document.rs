@@ -6,7 +6,9 @@
 //! as one with it, the classifier is reporting the filler, not the signal.
 //!
 //! Run with: `cargo run --release --example long_document`
+use burn_setfit::bundle::Bundle;
 use burn_setfit::checkpoint::Checkpoint;
+use burn_setfit::chunk::ChunkConfig;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::head::TaskMode;
 use burn_setfit::infer::{Classifier, decode_against_background};
@@ -80,6 +82,18 @@ fn train(
     )?;
     trainer.fit_with(|_| {})?;
     Ok(trainer.finish()?)
+}
+
+/// The same trained model, repacked to read documents in `max_tokens` windows.
+///
+/// Windowing happens only at inference, so this changes nothing the model
+/// learned, only how much filler shares a window with the signal.
+fn with_windows(bundle: &[u8], max_tokens: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let unpacked = Bundle::unpack(bundle)?;
+    let module = unpacked.load_module(&Default::default())?;
+    let mut manifest = unpacked.manifest.clone();
+    manifest.classifier.chunk = ChunkConfig::new(max_tokens).with_overlap(max_tokens / 8);
+    Ok(Bundle::pack(&module, &manifest, &unpacked.tokenizer)?)
 }
 
 /// Score a document and its control, and report whether they can be told apart.
@@ -295,6 +309,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &signal_doc,
         &control_doc,
         Some(3),
+    )?;
+
+    // Is the background class failing because the signal is diluted within
+    // its window? Same model, smaller windows: less filler per window.
+    for tokens in [128, 64] {
+        let narrow = with_windows(&bg, tokens)?;
+        evaluate(
+            &format!(
+                "MULTI-LABEL + background class DECODED AS ONE, MaxLogits, {tokens}-token windows"
+            ),
+            &narrow,
+            Reducer::MaxLogits,
+            None,
+            &signal_doc,
+            &control_doc,
+            Some(3),
+        )?;
+    }
+    let narrow = with_windows(&multi, 64)?;
+    evaluate(
+        "MULTI-LABEL, MaxLogits, 64-token windows",
+        &narrow,
+        Reducer::MaxLogits,
+        None,
+        &signal_doc,
+        &control_doc,
+        None,
     )?;
 
     Ok(())
