@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-167 tests, about two seconds, no network. Stay in this loop. Anything touching
+185 tests, a few seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 

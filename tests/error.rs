@@ -69,3 +69,21 @@ fn the_error_type_is_usable_as_a_boxed_std_error() {
     let err = fails().expect_err("an empty slice is not a bundle");
     assert!(err.to_string().contains("bundle error"));
 }
+
+#[test]
+fn every_variant_says_what_kind_of_failure_it_was() {
+    let cases = [
+        (SetFitError::Store("s".into()), "store error: s"),
+        (SetFitError::Config("c".into()), "config error: c"),
+        (SetFitError::Tokenizer("t".into()), "tokenizer error: t"),
+        (SetFitError::Bundle("b".into()), "bundle error: b"),
+        (SetFitError::Download("d".into()), "download error: d"),
+        (SetFitError::Training("x".into()), "training error: x"),
+        (SetFitError::Readback("r".into()), "readback error: r"),
+    ];
+    for (err, shown) in cases {
+        assert_eq!(err.to_string(), shown);
+    }
+    let io: SetFitError = std::io::Error::other("disk").into();
+    assert_eq!(io.to_string(), "io error: disk");
+}

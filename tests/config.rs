@@ -366,3 +366,16 @@ fn a_config_survives_a_json_round_trip() {
     assert_eq!(restored.chunk.overlap_tokens, 16);
     assert_eq!(restored.hierarchy_fanout, Some(4));
 }
+
+#[test]
+fn a_background_index_past_the_labels_is_refused() {
+    // Only reachable through a hand-edited or version-skewed manifest:
+    // `with_background_class` takes a name and can't produce it.
+    let mut config = ClassifierConfig::new(["alpha", "beta"]);
+    config.background = Some(2);
+    let err = config.validate().unwrap_err();
+    assert!(
+        format!("{err}").contains("background class is label 2"),
+        "{err}"
+    );
+}

@@ -25,7 +25,7 @@ verified, and what is not, matters more than a version number here:
 
 | | |
 | --- | --- |
-| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 167 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). Native `wgpu` trains and classifies, and agrees with `NdArray` ([#5]). |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 185 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). Native `wgpu` trains and classifies, and agrees with `NdArray` ([#5]). |
 | **Run on software Vulkan only** | `wgpu` — the suite passes on Mesa's lavapipe (`llvmpipe`, `device_type: Cpu`), which exercises the whole backend but is not hardware ([#5]). |
 | **Run in a headless browser on a software GPU only** | `wgpu` on `wasm32`, i.e. WebGPU in a browser. Needs an explicit opt-in — see [Features](#features). The excel-embed add-in trained, packed and classified through it in headless Chromium on SwiftShader (a software Vulkan), with losses matching `ndarray`. Never on real GPU hardware, and never in Safari. |
 | **Reported, not reproduced here** | The real model in a real browser: the maintainer runs this client-side in an Excel add-in on `NdArray` ([#1]). The repository's own harness still only drives a 146 KB stand-in. |

@@ -280,3 +280,31 @@ fn a_body_whose_heads_do_not_divide_its_width_is_refused() {
     let err = checkpoint.validate().expect_err("indivisible head count");
     assert!(format!("{err}").contains("divisible"), "unhelpful: {err}");
 }
+
+#[test]
+fn a_manifest_describing_an_impossible_body_is_refused() {
+    let classifier = ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking());
+    let body = |f: fn(&mut MiniLmConfig)| {
+        let mut b = toy_body_config();
+        f(&mut b);
+        Manifest::new(MiniLmVariant::L6, b, classifier.clone())
+    };
+    let no_layers = body(|b| b.num_hidden_layers = 0).validate().unwrap_err();
+    assert!(format!("{no_layers}").contains("no width or no layers"));
+    let no_width = body(|b| b.hidden_size = 0).validate().unwrap_err();
+    assert!(format!("{no_width}").contains("no width or no layers"));
+    let heads = body(|b| b.num_attention_heads = 3).validate().unwrap_err();
+    assert!(format!("{heads}").contains("not divisible by num_attention_heads"));
+}
+
+#[test]
+fn a_manifest_reports_its_labels_and_task() {
+    let manifest = Manifest::new(
+        MiniLmVariant::L6,
+        toy_body_config(),
+        ClassifierConfig::new(["alpha", "beta", "gamma"]).multi_label_at(0.4),
+    );
+    assert_eq!(manifest.labels(), ["alpha", "beta", "gamma"]);
+    assert_eq!(manifest.num_labels(), 3);
+    assert!(manifest.task().is_multi_label());
+}

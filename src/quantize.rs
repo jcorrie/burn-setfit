@@ -237,8 +237,8 @@ pub(crate) fn compress(weights: &[u8], mode: Quantization) -> Result<Vec<u8>> {
         }
     }
 
-    // Sorted so the header key order is at least stable within a run. It is
-    // still not canonical across runs — see the note in `bundle.rs` and #6.
+    // Sorted for a stable order; `Bundle::pack` canonicalises the header
+    // afterwards (see `canonical_safetensors` in bundle.rs).
     out.sort_by(|a, b| a.0.cmp(&b.0));
     safetensors::serialize(out, metadata.metadata().clone()).map_err(store_err)
 }
@@ -314,4 +314,80 @@ pub(crate) fn expand(weights: &[u8]) -> Result<Vec<u8>> {
 
     out.sort_by(|a, b| a.0.cmp(&b.0));
     safetensors::serialize(out, metadata.metadata().clone()).map_err(store_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-tensor blob big enough to be worth compressing.
+    fn blob(values: &[f32], shape: Vec<usize>) -> Vec<u8> {
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let view = TensorView::new(Dtype::F32, shape, &data).unwrap();
+        safetensors::serialize([("w", view)], None).unwrap()
+    }
+
+    fn values(bytes: &[u8], name: &str) -> (Dtype, Vec<f32>) {
+        let parsed = SafeTensors::deserialize(bytes).unwrap();
+        let view = parsed.tensor(name).unwrap();
+        (view.dtype(), f32_data(&view))
+    }
+
+    #[test]
+    fn a_tensor_with_a_non_finite_weight_is_stored_as_is() {
+        let mut v = vec![0.5f32; MIN_ELEMENTS];
+        v[17] = f32::NAN;
+        v[18] = f32::INFINITY;
+        for mode in [Quantization::F16, Quantization::Int8] {
+            let packed = compress(&blob(&v, vec![64, MIN_ELEMENTS / 64]), mode).unwrap();
+            let (dtype, back) = values(&packed, "w");
+            assert_eq!(dtype, Dtype::F32, "{mode:?}: left uncompressed");
+            assert!(back[17].is_nan() && back[18] == f32::INFINITY, "{mode:?}");
+            assert_eq!(values(&expand(&packed).unwrap(), "w").1.len(), v.len());
+        }
+    }
+
+    #[test]
+    fn small_and_one_dimensional_tensors_stay_exact() {
+        let v: Vec<f32> = (0..MIN_ELEMENTS).map(|i| i as f32 * 1e-3).collect();
+        let vector = compress(&blob(&v, vec![MIN_ELEMENTS]), Quantization::Int8).unwrap();
+        assert_eq!(values(&vector, "w"), (Dtype::F32, v.clone()), "a bias");
+        let small = &v[..MIN_ELEMENTS - 1];
+        let matrix = compress(&blob(small, vec![1, small.len()]), Quantization::Int8).unwrap();
+        assert_eq!(
+            values(&matrix, "w"),
+            (Dtype::F32, small.to_vec()),
+            "too small"
+        );
+    }
+
+    #[test]
+    fn an_int8_tensor_without_its_scales_is_a_corrupt_bundle() {
+        let data = vec![1u8; 8];
+        let view = TensorView::new(Dtype::I8, vec![2, 4], &data).unwrap();
+        let orphan = safetensors::serialize([("w", view)], None).unwrap();
+        let err = expand(&orphan).unwrap_err();
+        assert!(
+            matches!(&err, SetFitError::Bundle(m) if m.contains("__q_scale__w")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_all_zero_row_dequantizes_to_exact_zeros() {
+        let mut v = vec![0.0f32; MIN_ELEMENTS];
+        v[MIN_ELEMENTS - 1] = 3.0; // only the last row is non-zero
+        let packed = compress(&blob(&v, vec![64, MIN_ELEMENTS / 64]), Quantization::Int8).unwrap();
+        let (_, back) = values(&expand(&packed).unwrap(), "w");
+        assert!(back[..MIN_ELEMENTS - 64].iter().all(|&x| x == 0.0));
+        assert!((back[MIN_ELEMENTS - 1] - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn modes_name_themselves_as_the_manifest_does() {
+        assert_eq!(Quantization::None.as_str(), "none");
+        assert_eq!(Quantization::F16.as_str(), "f16");
+        assert_eq!(Quantization::Int8.as_str(), "int8");
+        assert!(Quantization::None.is_lossless() && !Quantization::Int8.is_lossless());
+    }
 }
