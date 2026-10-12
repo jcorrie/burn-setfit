@@ -56,9 +56,13 @@ jobs:
   # item 4): does training stay responsive and classify correctly at full size?
   browser-real:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'measure'
-    name: browser harness on real MiniLM
+    name: browser harness on real MiniLM (${{ matrix.engine }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [chromium, webkit]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -92,17 +96,18 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: browser-test/package-lock.json
-      - name: Install Playwright Chromium
+      - name: Install Playwright ${{ matrix.engine }}
         working-directory: browser-test
         run: |
           npm ci
-          npx playwright install --with-deps chromium
+          npx playwright install --with-deps ${{ matrix.engine }}
       - name: Run harness
         working-directory: browser-test
         run: |
           set -o pipefail
           node run.mjs 2>&1 | tee output.txt
         env:
+          BROWSER: ${{ matrix.engine }}
           TIMEOUT_MS: '1800000'
           # Measured: a contrastive step on the real model stalls the main
           # thread for ~3 s, so stalls are reported here rather than failed on.
@@ -112,7 +117,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Browser harness on all-MiniLM-L6-v2"
+            echo "## Browser harness on all-MiniLM-L6-v2 (${{ matrix.engine }})"
             echo
             echo '```'
             cat browser-test/output.txt
