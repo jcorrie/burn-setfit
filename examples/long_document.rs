@@ -96,6 +96,23 @@ fn with_windows(bundle: &[u8], max_tokens: usize) -> Result<Vec<u8>, Box<dyn std
     Ok(Bundle::pack(&module, &manifest, &unpacked.tokenizer)?)
 }
 
+/// The same trained model, repacked with `background` as its background class.
+///
+/// The rows "decoded as one" pass the background to `decode_against_background`
+/// by hand, which leaves the manifest without one. Anything that reads the
+/// manifest instead (`classify_chunks`, `with_chunk_votes`) needs it set, or it
+/// treats the background as an ordinary label that can be predicted.
+fn with_background(
+    bundle: &[u8],
+    background: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let unpacked = Bundle::unpack(bundle)?;
+    let module = unpacked.load_module(&Default::default())?;
+    let mut manifest = unpacked.manifest.clone();
+    manifest.classifier.background = Some(background);
+    Ok(Bundle::pack(&module, &manifest, &unpacked.tokenizer)?)
+}
+
 /// Score a document and its control, and report whether they can be told apart.
 fn evaluate(
     name: &str,
@@ -167,7 +184,7 @@ fn evaluate(
     // background's best chunk, and a long document is mostly filler, so the
     // background's best is high in every document. Per chunk, billing only
     // has to beat the background where the billing sentence actually is.
-    if background.is_some() {
+    if let Some(b) = background {
         let votes = |doc: &str| -> Result<(usize, usize), Box<dyn std::error::Error>> {
             let chunks = classifier.classify_chunks(doc)?;
             let billing = chunks
@@ -181,7 +198,7 @@ fn evaluate(
         println!("  chunks that decode to billing, signal / control:        {sb}/{sn} / {cb}/{cn}");
         // The same rule as a decode mode (#14): a label any one chunk prefers
         // to the background is predicted.
-        let voting = Classifier::from_bundle(bundle, Default::default())?
+        let voting = Classifier::from_bundle(&with_background(bundle, b)?, Default::default())?
             .with_reducer(reducer)
             .with_chunk_votes(Some(std::num::NonZeroUsize::MIN));
         let by_votes = |doc: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -199,7 +216,6 @@ fn evaluate(
         );
         // The direct test of per-chunk competition: in each document's most
         // billing-like chunk, does billing beat the background?
-        let b = background.unwrap_or(0);
         let strongest = |doc: &str| -> Result<(f32, f32), Box<dyn std::error::Error>> {
             let chunks = classifier.classify_chunks(doc)?;
             let best = chunks
