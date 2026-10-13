@@ -453,11 +453,9 @@ fn a_partially_trained_model_can_still_be_inspected_deliberately() {
 /// Fingerprint a model by summing each parameter tensor, keyed by path.
 /// Sum a collected `f32` tensor's elements, read from its little-endian bytes.
 fn f32_sum(t: &burn_store::burn_pack::Tensor) -> f32 {
-    t.to_bytes()
-        .expect("tensor bytes")
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-        .sum()
+    let bytes = t.to_bytes().expect("tensor bytes");
+    let (words, _) = bytes.as_chunks::<4>();
+    words.iter().map(|b| f32::from_le_bytes(*b)).sum()
 }
 
 fn weights_of(bundle: &[u8]) -> Vec<(String, f32)> {
@@ -572,4 +570,54 @@ fn the_seed_reaches_head_initialisation_not_just_sampling() {
 
     assert_eq!(sums(untrained_head(3)), sums(untrained_head(3)));
     assert_ne!(sums(untrained_head(3)), sums(untrained_head(4)));
+}
+
+#[test]
+fn several_body_epochs_take_exactly_the_steps_promised() {
+    // The second epoch reshuffles the pairs and starts over; the step count
+    // the caller was shown up front must still be the one delivered.
+    let config = TrainConfig {
+        body_epochs: 3,
+        ..fast_config()
+    };
+    let mut trainer = Trainer::new(
+        &toy_checkpoint(),
+        single_label_config(),
+        separable_examples(),
+        config,
+        cpu(),
+    )
+    .expect("well-formed");
+    let promised = trainer.total_steps();
+    let one_epoch = Trainer::new(
+        &toy_checkpoint(),
+        single_label_config(),
+        separable_examples(),
+        fast_config(),
+        cpu(),
+    )
+    .unwrap()
+    .total_steps();
+    assert!(promised > one_epoch, "more epochs, more steps");
+
+    let mut body_steps = 0;
+    let mut last = None;
+    while let Some(p) = trainer.step().expect("steps") {
+        assert!(p.loss.is_finite());
+        assert_eq!(p.total_steps, promised);
+        if p.stage == Stage::Body {
+            body_steps += 1;
+        }
+        last = Some(p);
+    }
+    let last = last.expect("at least one step");
+    assert_eq!(last.step, promised);
+    assert_eq!(last.fraction(), 1.0);
+    let body_per_epoch = body_steps / 3;
+    assert_eq!(
+        body_steps,
+        body_per_epoch * 3,
+        "every epoch the same length"
+    );
+    trainer.finish().expect("packs");
 }

@@ -404,3 +404,80 @@ fn embedding_no_texts_yields_no_embeddings() {
             .is_empty()
     );
 }
+
+// ── the smaller surface ─────────────────────────────────────────────────────
+
+#[test]
+fn a_prediction_names_its_labels_and_its_top_score() {
+    let c = single_label();
+    let p = c.classify(&words(10)).unwrap();
+    let names = p.labels(c.manifest());
+    assert_eq!(names.len(), 1, "single-label picks one");
+    let (top, score) = p.top().expect("there are scores");
+    assert_eq!(names[0], c.labels()[top]);
+    assert_eq!(score, p.scores[top]);
+    assert!(p.scores.iter().all(|&s| s <= score));
+}
+
+#[test]
+fn a_classifier_assembled_from_parts_matches_one_loaded_from_bytes() {
+    use burn_setfit::bundle::Bundle;
+
+    let config = ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking());
+    let bytes = toy_bundle(config);
+    let bundle = Bundle::unpack(&bytes).unwrap();
+    let from_parts = Classifier::new(
+        bundle.load_module(&cpu()).unwrap(),
+        bundle.load_tokenizer().unwrap(),
+        bundle.manifest.clone(),
+        cpu(),
+    )
+    .unwrap();
+    let from_bytes = Classifier::from_bundle(&bytes, cpu()).unwrap();
+
+    let text = words(40);
+    assert_eq!(
+        from_parts.classify(&text).unwrap().scores,
+        from_bytes.classify(&text).unwrap().scores
+    );
+}
+
+#[test]
+fn classifier_new_validates_the_manifest_it_is_given() {
+    use burn_setfit::bundle::Bundle;
+
+    let bundle = Bundle::unpack(&toy_bundle(
+        ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking()),
+    ))
+    .unwrap();
+    let mut broken = bundle.manifest.clone();
+    broken.body.num_hidden_layers = 0;
+    let result = Classifier::new(
+        bundle.load_module(&cpu()).unwrap(),
+        bundle.load_tokenizer().unwrap(),
+        broken,
+        cpu(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn per_chunk_output_is_the_same_whatever_the_batch_size() {
+    // More chunks than a batch holds, so the full-batch flush runs mid-document.
+    let c = single_label();
+    let text = words(400);
+    let whole = c.classify_chunks(&text).unwrap();
+    assert!(whole.len() > 3, "the document must span several batches");
+    let batched = single_label()
+        .with_batch_size(2)
+        .classify_chunks(&text)
+        .unwrap();
+    assert_eq!(whole.len(), batched.len());
+    for (a, b) in whole.iter().zip(&batched) {
+        assert_eq!(a.byte_range, b.byte_range);
+        assert_eq!(a.predicted, b.predicted);
+        for (x, y) in a.scores.iter().zip(&b.scores) {
+            assert!((x - y).abs() < 1e-5, "{x} vs {y}");
+        }
+    }
+}

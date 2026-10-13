@@ -15,6 +15,7 @@ use crate::readback::{self, blocking};
 use crate::reduce::{DocAccumulator, Reducer};
 use crate::tokenize::{Tokenizer, pad_batch};
 use burn::tensor::Device;
+use core::num::NonZeroUsize;
 use core::ops::Range;
 
 /// How many chunks are encoded per forward pass.
@@ -209,6 +210,16 @@ impl Classifier {
         self
     }
 
+    /// Decide per chunk and predict labels that at least `min_chunks` chunks vote
+    /// for. See [`ClassifierConfig::with_chunk_votes`].
+    ///
+    /// A decode-time choice like [`Self::with_reducer`]. Pass `None` to go back
+    /// to decoding the reduced scores.
+    pub fn with_chunk_votes(mut self, min_chunks: Option<NonZeroUsize>) -> Self {
+        self.manifest.classifier.chunk_votes = min_chunks;
+        self
+    }
+
     /// A copy of this classifier with a different decision threshold.
     ///
     /// Cheap: the weights are shared, only the configuration is copied. Useful for
@@ -312,6 +323,8 @@ impl Classifier {
         // Tracked per label, because which label matters is not known until the
         // document is fully reduced. Bounded at limit x labels either way.
         let mut evidence: Vec<Vec<Evidence>> = vec![Vec::new(); num_labels];
+        // Chunks that predict each label on their own, for `chunk_votes`.
+        let mut votes = vec![0usize; num_labels];
 
         let chunker = Chunker::new(source, &self.tokenizer, self.cfg().chunk);
         let mut batch: Vec<Chunk> = Vec::with_capacity(self.batch_size);
@@ -319,19 +332,22 @@ impl Classifier {
         for chunk in chunker {
             batch.push(chunk?);
             if batch.len() == self.batch_size {
-                self.run_batch(&batch, &mut accumulator, &mut evidence)
+                self.run_batch(&batch, &mut accumulator, &mut evidence, &mut votes)
                     .await?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            self.run_batch(&batch, &mut accumulator, &mut evidence)
+            self.run_batch(&batch, &mut accumulator, &mut evidence, &mut votes)
                 .await?;
         }
 
         let logits = accumulator.finish();
         let scores = to_probabilities(&logits, self.cfg().task);
-        let predicted = decode_against_background(&scores, self.cfg().task, self.cfg().background);
+        let predicted = match self.cfg().chunk_votes {
+            Some(min_chunks) => decide_by_votes(&votes, &scores, self.cfg().task, min_chunks),
+            None => decode_against_background(&scores, self.cfg().task, self.cfg().background),
+        };
 
         // Keep only the evidence for labels the document actually got.
         let mut evidence: Vec<Evidence> = predicted
@@ -456,11 +472,19 @@ impl Classifier {
         batch: &[Chunk],
         accumulator: &mut DocAccumulator,
         evidence: &mut [Vec<Evidence>],
+        votes: &mut [usize],
     ) -> Result<()> {
         let rows = self.forward_rows(batch).await?;
         for (chunk, row) in batch.iter().zip(&rows) {
             accumulator.push(chunk.token_count as f32, row);
             self.record_evidence(chunk, row, evidence);
+            // The same decode `classify_chunks` reports per row, so a vote is
+            // exactly a row whose `predicted` names the label.
+            let scores = to_probabilities(row, self.cfg().task);
+            for label in decode_against_background(&scores, self.cfg().task, self.cfg().background)
+            {
+                votes[label] += 1;
+            }
         }
         Ok(())
     }
@@ -596,9 +620,11 @@ pub fn decode(scores: &[f32], task: TaskMode) -> Vec<usize> {
 /// a label counts only if it is stronger than "nothing in particular".
 ///
 /// - **Multi-label** — a label must clear the threshold *and* outscore the
-///   background. The second test is the one that matters over long documents,
-///   where scores compress toward the middle and a fixed threshold stops
-///   discriminating long before the ordering does.
+///   background. Note the comparison is made on reduced scores; on a long
+///   document the background's best chunk is high whatever else the document
+///   says, so this rarely helps there. Deciding each chunk on its own does
+///   ([`ClassifierConfig::with_chunk_votes`], [`decide_by_votes`]; see the
+///   README's long-document section).
 /// - **Single-label** — the argmax still wins, but if it *is* the background
 ///   class the document predicts nothing. That is how a softmax abstains: not by
 ///   scoring low, which it cannot do, but by having somewhere to put the mass.
@@ -644,6 +670,54 @@ pub fn decode_against_background(
             .filter(|(i, s)| *i != background && **s >= threshold && **s > floor)
             .map(|(i, _)| i)
             .collect(),
+    }
+}
+
+/// Labels predicted by enough chunks on their own.
+///
+/// `votes[i]` is how many chunks decoded to label `i` by themselves (the
+/// background class never does, so it never wins here either). Multi-label
+/// predicts every label with at least `min_chunks` votes. Single-label predicts
+/// the most-voted label if it has enough, breaking ties on the reduced `scores`.
+///
+/// ```
+/// use burn_setfit::TaskMode;
+/// use burn_setfit::infer::decide_by_votes;
+/// use std::num::NonZeroUsize;
+///
+/// let votes = [2, 0, 5];
+/// let scores = [0.3, 0.1, 0.2];
+/// let two = NonZeroUsize::new(2).unwrap();
+///
+/// // Two passages naming a label is enough, however low its reduced score.
+/// assert_eq!(decide_by_votes(&votes, &scores, TaskMode::multi_label(), two), vec![0, 2]);
+///
+/// // Single-label takes the most votes, not the highest score.
+/// assert_eq!(decide_by_votes(&votes, &scores, TaskMode::SingleLabel, two), vec![2]);
+///
+/// // And abstains when no label has enough.
+/// let six = NonZeroUsize::new(6).unwrap();
+/// assert!(decide_by_votes(&votes, &scores, TaskMode::SingleLabel, six).is_empty());
+/// ```
+pub fn decide_by_votes(
+    votes: &[usize],
+    scores: &[f32],
+    task: TaskMode,
+    min_chunks: NonZeroUsize,
+) -> Vec<usize> {
+    let enough = |i: &usize| votes[*i] >= min_chunks.get();
+    match task {
+        TaskMode::SingleLabel => (0..votes.len())
+            .filter(enough)
+            .max_by(|&a, &b| {
+                votes[a].cmp(&votes[b]).then_with(|| {
+                    let score = |i: usize| scores.get(i).copied().unwrap_or(f32::NEG_INFINITY);
+                    score(a).total_cmp(&score(b))
+                })
+            })
+            .map(|i| vec![i])
+            .unwrap_or_default(),
+        TaskMode::MultiLabel { .. } => (0..votes.len()).filter(enough).collect(),
     }
 }
 

@@ -25,14 +25,14 @@ verified, and what is not, matters more than a version number here:
 
 | | |
 | --- | --- |
-| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 167 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). Native `wgpu` trains and classifies, and agrees with `NdArray` ([#5]). |
+| **Verified** | Embedding path reproduces `all-MiniLM-L6-v2` exactly (below). 185 offline tests. Native training and inference, on `NdArray`. Training and inference in a browser, on a toy checkpoint ([below](#webassembly)). Native `wgpu` trains and classifies, and agrees with `NdArray` ([#5]). |
 | **Run on software Vulkan only** | `wgpu` — the suite passes on Mesa's lavapipe (`llvmpipe`, `device_type: Cpu`), which exercises the whole backend but is not hardware ([#5]). |
 | **Run in a headless browser on a software GPU only** | `wgpu` on `wasm32`, i.e. WebGPU in a browser. Needs an explicit opt-in — see [Features](#features). The excel-embed add-in trained, packed and classified through it in headless Chromium on SwiftShader (a software Vulkan), with losses matching `ndarray`. Never on real GPU hardware, and never in Safari. |
 | **Reported, not reproduced here** | The real model in a real browser: the maintainer runs this client-side in an Excel add-in on `NdArray` ([#1]). The repository's own harness still only drives a 146 KB stand-in. |
-| **Known limitation** | Long-document classification separates signal from filler only in one configuration ([below](#a-measured-limitation), [#4]). A background class and per-chunk output now address the decode half; the table has not been re-measured. |
+| **Known limitation** | Long-document classification separates signal from filler with multi-label `MaxLogits` once the threshold is calibrated, or with a background class decided per chunk in small windows; decoding against a background class after reduction does not help ([below](#a-measured-limitation), #12, #14). |
 
 Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
-[#1] and [#2] are the two that matter.
+#12 holds what still needs the real checkpoint.
 
 [#1]: https://github.com/jcorrie/burn-setfit/issues/1
 [#2]: https://github.com/jcorrie/burn-setfit/issues/2
@@ -185,8 +185,7 @@ cargo test --doc --features ndarray,train,native
 | `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
 | `tests/async_api.rs` | That the `_async` methods and their blocking wrappers agree exactly |
 | `tests/quantize.rs` | That every precision round-trips, shrinks, and stays close to fp32 |
-| `tests/background.rs` | The background-class decision rule, and per-chunk output |
-| `tests/wgpu.rs` | The `wgpu` backend against `ndarray` (needs the feature) |
+| `tests/background.rs` | The background-class decision rule, per-chunk output, and deciding by chunk votes |
 | `tests/wgpu.rs` | That the `wgpu` backend runs at all, and agrees with `ndarray` (needs `--features wgpu`) |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
@@ -240,17 +239,20 @@ in `tests/reduce.rs`); the hierarchy exists for the nonlinear reducers, where
 
 `examples/long_document.rs` plants one billing complaint in ~13 KB of unrelated
 filler and classifies both that document and a filler-only control. If a
-classifier reports the same score for both, it is reading the filler:
+classifier reports the same score for both, it is reading the filler. Measured
+on `all-MiniLM-L6-v2` by the Measure workflow (`.github/workflows/measure.yml`),
+one training run per row group:
 
-| Configuration                         | With signal | Control | Separation |
-| ------------------------------------- | ----------- | ------- | ---------- |
-| Single-label, `MeanLogits`            | 0.698       | 0.672   | **+0.026** |
-| Multi-label, `NoisyOr`                | 1.000       | 1.000   | **+0.000** |
-| Multi-label, `NoisyOr`, blocks of 8   | 0.997       | 0.995   | **+0.002** |
-| Multi-label, `MaxLogits`              | 0.764       | 0.559   | **+0.206** |
-| Multi-label + background, `MaxLogits` | 0.389       | 0.169   | **+0.220** |
+| Configuration                         | With signal | Control | Separation | Default verdict (signal / control) | Thresholds that get both right |
+| ------------------------------------- | ----------- | ------- | ---------- | ---------------------------------- | ------------------------------ |
+| Single-label, `MeanLogits`            | 0.737       | 0.714   | **+0.023** | billing / billing                  | — (a softmax cannot abstain)   |
+| Multi-label, `NoisyOr`                | 1.000       | 1.000   | **+0.000** | everything / everything            | none                           |
+| Multi-label, `NoisyOr`, blocks of 8   | 0.999       | 0.998   | **+0.001** | billing, feature / same            | none usable                    |
+| Multi-label, `MaxLogits`              | 0.808       | 0.617   | **+0.191** | billing / billing                  | **0.62 – 0.81**                |
+| Multi-label + background, `MaxLogits` | 0.392       | 0.164   | **+0.228** | other / other                      | **0.17 – 0.39**                |
+| … decoded against the background      | 0.392       | 0.164   | +0.228     | nothing / nothing                  | none                           |
 
-Two conclusions, both load-bearing:
+Three conclusions, all load-bearing:
 
 **A single-label softmax head cannot abstain.** Every chunk must be assigned to
 some class, so filler votes as confidently as signal. With 12 chunks of which one
@@ -263,19 +265,17 @@ eight chunks reach `1 - 0.4⁸ ≈ 0.999` and every label fires. Reducing
 hierarchically does not rescue it — saturation happens inside the first block.
 This measurement is why `Reducer::default_for(MultiLabel)` is `MaxLogits`.
 
-**If you classify long documents, use multi-label with `MaxLogits`, and train a
-background class** on text representative of your filler. That is the only
-configuration above that both separates signal from noise and correctly rejects
-the control — though note it is *under-confident*: the signal document scores
-0.389 and so predicts `other` at the default 0.5 threshold. It separates well and
-calibrates badly.
+**`MaxLogits` separates, and the threshold has to be calibrated.** It is the
+only reducer whose scores tell the documents apart, but at the default 0.5 both
+are labelled billing. Any threshold between the control's score and the
+signal's gets both right, so pick it on held-out documents of your own:
+`Classifier::clone_with_threshold` makes a sweep cheap. Training a background
+class lowers every score (the window moves to 0.17 – 0.39) without widening it.
 
-### Decoding against a background class
+### Why the background class does not help here
 
-That last sentence is a decode problem, not a training one, so it has a
-decode-time answer. Naming the background class changes the question from "is
-billing above 0.5?" — which the numbers above answer badly — to "is billing
-above *other*?", which is what the separation actually measures:
+Decoding against a background class asks "is billing above *other*?" rather than
+"is billing above a fixed threshold?":
 
 ```rust
 let config = ClassifierConfig::new(["billing", "outage", "feature", "other"])
@@ -283,17 +283,52 @@ let config = ClassifierConfig::new(["billing", "outage", "feature", "other"])
     .with_background_class("other")?;
 ```
 
-The class is still trained like any other; what changes is that it stops being
-something the model can predict and becomes the bar every other label clears. It
-also gives a single-label head somewhere to abstain *to*: a softmax over real
-classes cannot say "none", but one whose argmax lands on the background class
-can, and then predicts nothing.
+On long documents it predicts nothing for either one, and the example's
+diagnostics show why. Under `MaxLogits` the background's document score is its
+best chunk's, and a long document is mostly filler, so *other* scores 0.79 in
+both. Nor does comparing chunk by chunk rescue it at the default window: in the
+signal document's most billing-like chunk, billing scores 0.39 against
+*other*'s 0.61. The billing sentence is one of roughly ten in its 256-token
+window, so that window really is mostly *other*.
 
-`tests/background.rs` pins the decision rule, which is exact arithmetic. Whether
-it *classifies* long documents better is a separate question that needs the real
-checkpoint — `examples/long_document.rs` has the row, and the table above has
-not been re-measured with it. [#4] stays open for that, and for threshold
-calibration.
+Narrower windows remove the dilution. The same trained model, repacked to read
+in smaller windows (windowing happens only at inference):
+
+| Windows | Billing chunk: billing vs *other* | Control's most billing-like chunk | Chunks that decode to billing, signal / control |
+| ------- | --------------------------------- | --------------------------------- | ----------------------------------------------- |
+| 256     | 0.40 vs 0.59                      | 0.17 vs 0.76                      | 0 / 12 — 0 / 12                                 |
+| 128     | 0.39 vs 0.57                      | 0.11 vs 0.80                      | 0 / 27 — 0 / 27                                 |
+| **64**  | **0.66 vs 0.39**                  | 0.11 vs 0.88                      | **2 / 61 — 0 / 60**                             |
+
+At 64 tokens, deciding *per chunk* against the background gets both documents
+right at the default threshold, and without any calibration. The
+document-level decode still predicts nothing there (*other*'s best chunk
+scores 0.91). The working rule — "a label is predicted if some chunk prefers it
+to the background" — is a decode mode, `with_chunk_votes` (#14):
+
+```rust
+let classifier = Classifier::from_bundle(&bundle, device)?
+    .with_chunk_votes(Some(NonZeroUsize::MIN)); // any one chunk will do
+```
+
+Each chunk is decoded exactly as `classify_chunks` reports it, and a label is
+predicted once at least that many chunks name it. Measured on the real model,
+`with_chunk_votes(1)` predicts billing for the signal document and nothing
+for the control at 64-token windows, and nothing for either at 128 or 256. It is decode-time, so it can
+be set on a trained model, or stored in the config with
+`ClassifierConfig::with_chunk_votes`. Two open questions stay with #14: which
+window to default to when a background class is set (64 worked on one planted
+sentence, 128 did not), and whether one chunk is too eager on real documents —
+raising the count is the knob for that.
+
+Plain multi-label `MaxLogits` also separates better at 64 tokens (+0.33
+against +0.19 at 256), with a wider threshold window (0.57 – 0.90).
+
+The decision rules are exact and pinned by `tests/background.rs`, including
+that the vote counts exactly the rows `classify_chunks` reports. The
+background class gives a single-label head somewhere to abstain *to*, and it
+suits inputs whose chunks are mostly on-topic. One sentence in a long document needs small windows and a
+per-chunk decision, or a calibrated threshold.
 
 ### Per-chunk output
 
@@ -336,6 +371,25 @@ throughout, which is the entire reason `Trainer` is a step-wise state machine
 rather than a `fit()` loop. The 133 ms outlier is the body-to-head transition,
 which embeds the whole training set inside one `step()`.
 
+**Those numbers are the toy checkpoint's.** The Measure workflow runs the same
+harness on the real `all-MiniLM-L6-v2` (single-threaded wasm, `ndarray`), in
+Chromium and in WebKit, the engine behind Safari and Excel for Mac:
+
+| | Toy (Chromium) | Real MiniLM-L6, Chromium | Real MiniLM-L6, WebKit |
+| --- | --- | --- | --- |
+| 26 training steps | 515 ms | 9.2 s | 13.5 s |
+| median main-thread frame gap during training | 17 ms | 17 ms | 19 ms |
+| **worst main-thread frame gap** | 133 ms | **3.0 s** | **2.3 s** |
+| classify a ~2 KB document (5 chunks) | 79 ms | 3.3 s | 5.7 s |
+| held-in examples correct | 12 / 12 | 12 / 12 | 12 / 12 |
+| bundle | 146 KB | 90.7 MB | 90.7 MB |
+
+It trains and classifies correctly at full size, but stepping once per frame
+does not keep a page responsive there: one contrastive step through the full
+body stalls the main thread for seconds. **Train in a Web Worker**, as
+excel-embed does, and drive `step()` from there; the step-wise API still matters,
+since it is what lets a worker report progress and be cancelled between steps.
+
 The `tokenizers` rayon worry that shaped `src/tokenize.rs` looks unfounded on
 this evidence — the single-sequence `encode` path runs fine in a browser. That
 is not a licence to reach for `encode_batch`, which remains untested there.
@@ -360,8 +414,8 @@ wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int \
 | | Before | After |
 | --- | --- | --- |
 | wasm (`wasm-opt -Oz`) | 8.45 MB | **5.78 MB** (−32%) |
-| bundle (`Quantization::F16`) | 86.1 MB | **43.1 MB** (−50%) |
-| bundle (`Quantization::Int8`) | 86.1 MB | **21.8 MB** (−75%) |
+| bundle (`Quantization::F16`) | 86.5 MB | **43.6 MB** (−50%) |
+| bundle (`Quantization::Int8`) | 86.5 MB | **22.3 MB** (−74%) |
 
 `wasm-opt` takes about five minutes on this artifact, which is why it is a
 release step rather than part of the build. Quantization is a decode-time
@@ -369,7 +423,7 @@ non-event: weights are expanded back to `f32` before Burn sees them, so the
 model computes identically on every backend — see [Quantization](#quantization)
 for what it costs.
 
-Training yields between steps, so a browser stays responsive:
+Training yields between steps. With the real model a step takes seconds, so run this loop in a Web Worker (see above); the main thread then only renders progress:
 
 ```js
 const trainer = new Trainer(configJson, weights, tokenizerJson, request);
@@ -391,9 +445,9 @@ Payload, and the part that actually matters:
 
 **The model dominates, not the code** — by an order of magnitude. Roughly half of
 MiniLM-L6's 22.7M parameters are the 30522×384 embedding table, which quantizes
-well; f16 should roughly halve the bundle and int8 roughly quarter it. Not yet
-implemented ([#2]). Cache the bundle in the Cache API or IndexedDB — it is one
-`fetch`, by design.
+well: f16 halves the bundle and int8 quarters it, with no wrong answers on the
+held-out probes ([Quantization](#quantization)). Cache the bundle in the Cache
+API or IndexedDB — it is one `fetch`, by design.
 
 ## Design notes
 
@@ -436,15 +490,18 @@ exactly the kind of tensor that survives losing precision.
 let bundle = trainer.finish_quantized(Quantization::F16)?;
 ```
 
-| Mode | Bundle | vs fp32 |
-| ---- | ------ | ------- |
-| `none` | 86.1 MB | 100% |
-| `f16`  | 43.1 MB | **50%** |
-| `int8` | 21.8 MB | **25%** |
+| Mode | Bundle | vs fp32 | Max score drift | Max cosine drift | Held-out probes |
+| ---- | ------ | ------- | --------------- | ---------------- | --------------- |
+| `none` | 86.5 MB | 100% | 0 | 4.8e-7 | 6/6 |
+| `f16`  | 43.6 MB | **50%** | 2.3e-5 | 5.4e-7 | 6/6 |
+| `int8` | 22.3 MB | **26%** | 2.4e-3 | 7.3e-4 | 6/6 |
 
-Measured with `cargo run --release --example quantize -- --sizes`. Bundle size
-depends only on tensor *shapes*, so those figures are exact for MiniLM-L6
-whatever the weights happen to be.
+Measured on the real `all-MiniLM-L6-v2` with `cargo run --release --example
+quantize`: one model trained once (103 steps) and packed three ways, so the rows
+differ only in storage. Drift is the largest change in any probe's class score,
+or in any embedding's cosine to its fp32 counterpart. GitHub's runners produce
+it on demand (`.github/workflows/measure.yml`); `--sizes` reproduces the size
+column offline from random weights, since size depends only on tensor shapes.
 
 **This is storage, not compute.** Burn's `Tensor::quantize` produces a `QFloat`
 that arithmetic runs *on*, which needs quantized-op support from every backend
@@ -464,13 +521,11 @@ A quantized bundle declares format version 2, so an older build refuses it
 outright instead of reading `f16` bytes as though they were `f32`. Unquantized
 bundles are still version 1 and unchanged.
 
-**What is not measured here.** Accuracy deviation on the real checkpoint is
-still open in [#2]: `cargo run --release --example quantize` reports it — score
-drift, cosine drift and held-out probes against the fp32 baseline — but it needs
-to download `all-MiniLM-L6-v2`, which the environment this was developed in
-could not reach. `tests/quantize.rs` bounds the drift on the toy model
-(f16 ~1e-5, int8 ~1e-4 on scores), which is enough to catch corruption and not
-enough to justify a number in this table.
+**What is not measured here.** Six probes say no answer flipped; they do not
+bound accuracy on your data. int8's score drift (2.4e-3) is a hundred times
+f16's, so a model whose decisions sit close to its threshold should prefer
+f16. `tests/quantize.rs` bounds the drift on the toy model (f16 ~1e-5, int8
+~1e-4 on scores), which catches corruption, not quality.
 
 ## Features
 

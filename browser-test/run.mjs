@@ -4,15 +4,26 @@
 // the checkpoint), drives it in Chromium, and exits non-zero if anything the
 // page asserts came back wrong.
 
-import { chromium } from 'playwright';
+import { chromium, webkit } from 'playwright';
 import { createServer } from 'node:http';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), 'public');
-const CHROME = process.env.CHROME_PATH ?? '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+// CHROME_PATH wins; then the sandbox's preinstalled Chromium; otherwise whatever
+// `npx playwright install chromium` put in place (CI does that).
+const SANDBOX_CHROME = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+const CHROME = process.env.CHROME_PATH ?? (existsSync(SANDBOX_CHROME) ? SANDBOX_CHROME : undefined);
+// BROWSER=webkit runs the same page in Playwright's WebKit, the engine behind
+// Safari and Excel for Mac (`npx playwright install webkit` first).
+const ENGINE = process.env.BROWSER ?? 'chromium';
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS ?? 180_000);
+// The worst main-thread stall allowed during training. 250 ms holds for the toy
+// checkpoint; on the real MiniLM a single contrastive step takes seconds, which
+// is why real use trains in a Web Worker (see the README).
+const FRAME_GAP_BUDGET_MS = Number(process.env.FRAME_GAP_BUDGET_MS ?? 250);
 
 const MIME = {
   '.html': 'text/html',
@@ -40,7 +51,11 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const url = `http://127.0.0.1:${server.address().port}/`;
 console.log(`serving ${ROOT} at ${url}`);
 
-const browser = await chromium.launch({ executablePath: CHROME });
+const browser =
+  ENGINE === 'webkit'
+    ? await webkit.launch()
+    : await chromium.launch({ executablePath: CHROME });
+console.log(`engine: ${ENGINE} ${browser.version()}`);
 const page = await browser.newPage();
 
 const consoleErrors = [];
@@ -76,7 +91,7 @@ if (result.short_correct !== result.short?.length) {
 if (!(result.long?.chunks_seen > 1)) failures.push('long document did not chunk');
 // The whole reason training is a step-wise state machine: no single step may
 // wedge the main thread. 250 ms is the threshold past which a tab feels stuck.
-if (!(result.responsiveness?.worst_frame_gap_ms < 250)) {
+if (!(result.responsiveness?.worst_frame_gap_ms < FRAME_GAP_BUDGET_MS)) {
   failures.push(`worst frame gap ${result.responsiveness?.worst_frame_gap_ms} ms`);
 }
 

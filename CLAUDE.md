@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-167 tests, about two seconds, no network. Stay in this loop. Anything touching
+191 tests, a few seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -53,6 +53,20 @@ the only configuration where a blocking readback is a real failure rather than a
 slow one, so it catches an `into_data()` that crept back in. It has never been
 executed on a GPU — the feature's name is load-bearing, do not rename it to
 something reassuring.
+
+## CI
+
+`.github/workflows/ci.yml` runs every command above on each pull request (not
+on pushes to `main`): fmt/clippy/docs, the main loop, an MSRV check, the three
+wasm builds, the wgpu suite on lavapipe, the browser harness, and the
+`--ignored` published-matrix check, which GitHub's runners *can* download. One
+job, "CI passed", rolls them up for branch protection. A command added to the
+loop above belongs in the workflow too.
+
+`.github/workflows/measure.yml` runs `examples/quantize.rs` and
+`examples/long_document.rs` on the real checkpoint, which this sandbox cannot
+download: from the Actions tab (Measure → Run workflow), or by giving a PR the
+`measure` label. The output lands on the run's summary page.
 
 ## Things that will bite
 
@@ -203,8 +217,11 @@ the published matrix.
 
 ## Open work
 
-See [issues](https://github.com/jcorrie/burn-setfit/issues). #1 is now half
-answered — `browser-test/` proves the wasm trains and classifies in a browser,
-but only against a toy checkpoint; the real model has never been fetched into a
-page. #2 (quantize the 86.5 MB bundle) is the other one that matters; the rest
-are smaller or speculative.
+See [issues](https://github.com/jcorrie/burn-setfit/issues). #12 holds what
+needs the real checkpoint. Its first two items now run on CI (the `--ignored`
+matrix check on every PR, quantization through the Measure workflow). What
+remains is long documents: a fixed threshold needs calibrating per model, and
+the background class only works decided per chunk in small windows
+(`with_chunk_votes`, #14, which still has to settle a default window and how
+many votes to ask for; see the README's long-document section). The real model
+reaches the browser harness only through the Measure workflow.

@@ -6,9 +6,12 @@
 //! as one with it, the classifier is reporting the filler, not the signal.
 //!
 //! Run with: `cargo run --release --example long_document`
+use burn_setfit::bundle::Bundle;
 use burn_setfit::checkpoint::Checkpoint;
+use burn_setfit::chunk::ChunkConfig;
 use burn_setfit::config::ClassifierConfig;
-use burn_setfit::infer::Classifier;
+use burn_setfit::head::TaskMode;
+use burn_setfit::infer::{Classifier, decode_against_background};
 use burn_setfit::minilm::MiniLmVariant;
 use burn_setfit::reduce::Reducer;
 use burn_setfit::train::{Example, TrainConfig, Trainer};
@@ -81,6 +84,35 @@ fn train(
     Ok(trainer.finish()?)
 }
 
+/// The same trained model, repacked to read documents in `max_tokens` windows.
+///
+/// Windowing happens only at inference, so this changes nothing the model
+/// learned, only how much filler shares a window with the signal.
+fn with_windows(bundle: &[u8], max_tokens: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let unpacked = Bundle::unpack(bundle)?;
+    let module = unpacked.load_module(&Default::default())?;
+    let mut manifest = unpacked.manifest.clone();
+    manifest.classifier.chunk = ChunkConfig::new(max_tokens).with_overlap(max_tokens / 8);
+    Ok(Bundle::pack(&module, &manifest, &unpacked.tokenizer)?)
+}
+
+/// The same trained model, repacked with `background` as its background class.
+///
+/// The rows "decoded as one" pass the background to `decode_against_background`
+/// by hand, which leaves the manifest without one. Anything that reads the
+/// manifest instead (`classify_chunks`, `with_chunk_votes`) needs it set, or it
+/// treats the background as an ordinary label that can be predicted.
+fn with_background(
+    bundle: &[u8],
+    background: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let unpacked = Bundle::unpack(bundle)?;
+    let module = unpacked.load_module(&Default::default())?;
+    let mut manifest = unpacked.manifest.clone();
+    manifest.classifier.background = Some(background);
+    Ok(Bundle::pack(&module, &manifest, &unpacked.tokenizer)?)
+}
+
 /// Score a document and its control, and report whether they can be told apart.
 fn evaluate(
     name: &str,
@@ -89,6 +121,7 @@ fn evaluate(
     fanout: Option<usize>,
     signal_doc: &str,
     control_doc: &str,
+    background: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut classifier = Classifier::from_bundle(bundle, Default::default())?.with_reducer(reducer);
     if let Some(f) = fanout {
@@ -109,11 +142,94 @@ fn evaluate(
         "  separation:                                             {:+.3}",
         signal_score - control_score
     );
+    let task = classifier.manifest().task();
+    let names = classifier.labels();
+    let decode = |scores: &[f32]| -> Vec<&str> {
+        decode_against_background(scores, task, background)
+            .into_iter()
+            .map(|i| names[i].as_str())
+            .collect()
+    };
     println!(
         "  predicted: {:?}   control predicted: {:?}",
-        with_signal.labels(classifier.manifest()),
-        control.labels(classifier.manifest())
+        decode(&with_signal.scores),
+        decode(&control.scores)
     );
+
+    // Calibration (#12): which multi-label thresholds would get both documents
+    // right — billing for the signal document, not for the control? With a
+    // background class, billing must also beat it.
+    if let TaskMode::MultiLabel { threshold } = task {
+        let (s, c) = (signal_score, control_score);
+        let floors = background.map(|b| (with_signal.scores[b], control.scores[b]));
+        if let Some((sf, cf)) = floors {
+            println!("  background score, signal / control:                     {sf:.3} / {cf:.3}");
+        }
+        let window = match floors {
+            Some((sf, _)) if s <= sf => None,
+            Some((_, cf)) if c <= cf => Some((0.0, s)),
+            _ if s > c => Some((c, s)),
+            _ => None,
+        };
+        match window {
+            Some((lo, hi)) => println!(
+                "  thresholds that get both right: above {lo:.3}, up to {hi:.3} (current {threshold})"
+            ),
+            None => println!("  no threshold gets both right (current {threshold})"),
+        }
+    }
+
+    // With a background class, also decode each chunk on its own. A
+    // document-level comparison pits billing's best chunk against the
+    // background's best chunk, and a long document is mostly filler, so the
+    // background's best is high in every document. Per chunk, billing only
+    // has to beat the background where the billing sentence actually is.
+    if let Some(b) = background {
+        let votes = |doc: &str| -> Result<(usize, usize), Box<dyn std::error::Error>> {
+            let chunks = classifier.classify_chunks(doc)?;
+            let billing = chunks
+                .iter()
+                .filter(|c| decode_against_background(&c.scores, task, background).contains(&0))
+                .count();
+            Ok((billing, chunks.len()))
+        };
+        let (sb, sn) = votes(signal_doc)?;
+        let (cb, cn) = votes(control_doc)?;
+        println!("  chunks that decode to billing, signal / control:        {sb}/{sn} / {cb}/{cn}");
+        // The same rule as a decode mode (#14): a label any one chunk prefers
+        // to the background is predicted.
+        let voting = Classifier::from_bundle(&with_background(bundle, b)?, Default::default())?
+            .with_reducer(reducer)
+            .with_chunk_votes(Some(std::num::NonZeroUsize::MIN));
+        let by_votes = |doc: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+            let prediction = voting.classify(doc)?;
+            Ok(prediction
+                .labels(voting.manifest())
+                .into_iter()
+                .map(String::from)
+                .collect())
+        };
+        println!(
+            "  with_chunk_votes(1) predicts: {:?}   control: {:?}",
+            by_votes(signal_doc)?,
+            by_votes(control_doc)?
+        );
+        // The direct test of per-chunk competition: in each document's most
+        // billing-like chunk, does billing beat the background?
+        let strongest = |doc: &str| -> Result<(f32, f32), Box<dyn std::error::Error>> {
+            let chunks = classifier.classify_chunks(doc)?;
+            let best = chunks
+                .iter()
+                .max_by(|x, y| x.scores[0].total_cmp(&y.scores[0]))
+                .ok_or("no chunks")?;
+            Ok((best.scores[0], best.scores[b]))
+        };
+        let (s_bill, s_bg) = strongest(signal_doc)?;
+        let (c_bill, c_bg) = strongest(control_doc)?;
+        println!(
+            "  most billing-like chunk, billing vs background:         signal {s_bill:.3} vs {s_bg:.3}, control {c_bill:.3} vs {c_bg:.3}"
+        );
+    }
 
     // A chunk is ~256 tokens, so roughly a thousand characters: report whether
     // the winning chunk actually contains the planted signal rather than
@@ -160,6 +276,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         &signal_doc,
         &control_doc,
+        None,
     )?;
 
     eprintln!("training multi-label ...");
@@ -180,7 +297,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(8),
         ),
     ] {
-        evaluate(name, &multi, reducer, fanout, &signal_doc, &control_doc)?;
+        evaluate(
+            name,
+            &multi,
+            reducer,
+            fanout,
+            &signal_doc,
+            &control_doc,
+            None,
+        )?;
     }
 
     eprintln!("training multi-label with a background class ...");
@@ -192,7 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bg = train(
         &checkpoint,
         ClassifierConfig::new(["billing", "outage", "feature", "other"]).multi_label(),
-        bg_examples.clone(),
+        bg_examples,
     )?;
     evaluate(
         "MULTI-LABEL + background class, MaxLogits",
@@ -201,28 +326,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         &signal_doc,
         &control_doc,
+        None,
     )?;
 
     // The same model and the same scores, decoded differently. Above, "other"
-    // is a label like any other and the verdict is still "is billing above
-    // 0.5?" — which the row above answers badly, because that configuration
-    // separates well and calibrates poorly. Naming it the background class
-    // changes the question to "is billing above other?", which is what the
-    // separation actually measures.
-    let bg_declared = train(
-        &checkpoint,
-        ClassifierConfig::new(["billing", "outage", "feature", "other"])
-            .multi_label()
-            .with_background_class("other")?,
-        bg_examples,
-    )?;
+    // is a label like any other and the verdict is still "is billing above the
+    // threshold?". Decoding against it as the background class changes the
+    // question to "is billing above the threshold *and* above other?". One
+    // model, so the two rows differ only in decoding (training it twice would
+    // compare two models).
     evaluate(
         "MULTI-LABEL + background class DECODED AS ONE, MaxLogits",
-        &bg_declared,
+        &bg,
         Reducer::MaxLogits,
         None,
         &signal_doc,
         &control_doc,
+        Some(3),
+    )?;
+
+    // Is the background class failing because the signal is diluted within
+    // its window? Same model, smaller windows: less filler per window.
+    for tokens in [128, 64] {
+        let narrow = with_windows(&bg, tokens)?;
+        evaluate(
+            &format!(
+                "MULTI-LABEL + background class DECODED AS ONE, MaxLogits, {tokens}-token windows"
+            ),
+            &narrow,
+            Reducer::MaxLogits,
+            None,
+            &signal_doc,
+            &control_doc,
+            Some(3),
+        )?;
+    }
+    let narrow = with_windows(&multi, 64)?;
+    evaluate(
+        "MULTI-LABEL, MaxLogits, 64-token windows",
+        &narrow,
+        Reducer::MaxLogits,
+        None,
+        &signal_doc,
+        &control_doc,
+        None,
     )?;
 
     Ok(())

@@ -16,6 +16,7 @@ use crate::chunk::ChunkConfig;
 use crate::error::{Result, SetFitError};
 use crate::head::TaskMode;
 use crate::reduce::Reducer;
+use core::num::NonZeroUsize;
 
 /// How a trained model classifies.
 ///
@@ -64,6 +65,13 @@ pub struct ClassifierConfig {
     /// See [`Self::with_background_class`].
     #[serde(default)]
     pub background: Option<usize>,
+    /// Decide each chunk on its own and count the votes, rather than decoding
+    /// the reduced scores. See [`Self::with_chunk_votes`].
+    ///
+    /// Skipped when unset, so a bundle that does not use it is byte-for-byte
+    /// what it was before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_votes: Option<NonZeroUsize>,
 }
 
 impl ClassifierConfig {
@@ -81,6 +89,7 @@ impl ClassifierConfig {
             reducer: Reducer::default_for(task),
             hierarchy_fanout: None,
             background: None,
+            chunk_votes: None,
         }
     }
 
@@ -146,13 +155,16 @@ impl ClassifierConfig {
     /// model can *predict*. Instead it becomes the bar every other label has to
     /// clear.
     ///
-    /// This is aimed at the failure measured in
-    /// [#4](https://github.com/jcorrie/burn-setfit/issues/4): over a long
-    /// document, a configuration can separate signal from filler well and still
-    /// decide wrongly, because the absolute scores sit on the wrong side of a
-    /// fixed threshold. Comparing against a background class asks the question
-    /// the separation actually answers — "is this label stronger than nothing in
-    /// particular?" — instead of "is this label above 0.5?".
+    /// Comparing against a background class asks "is this label stronger than
+    /// nothing in particular?" instead of "is this label above 0.5?". It was
+    /// aimed at long documents, where scores sit on the wrong side of a fixed
+    /// threshold, and measured on the real checkpoint it does *not* fix that
+    /// case: one relevant sentence in a 256-token window leaves the window
+    /// mostly background, so the background wins everywhere (README, "Why the
+    /// background class does not help here"). Calibrate the threshold, or
+    /// read in small windows and decide per chunk with
+    /// [`Self::with_chunk_votes`]. Decoded after reduction, it suits inputs
+    /// whose chunks are mostly on-topic.
     ///
     /// It also gives a single-label head somewhere to abstain *to*. A softmax
     /// over real classes cannot say "none"; a softmax whose argmax lands on the
@@ -191,6 +203,43 @@ impl ClassifierConfig {
                 self.labels
             ))),
         }
+    }
+
+    /// Predict a label when at least `min_chunks` chunks predict it on their own.
+    ///
+    /// Each chunk is decoded with the usual rules — threshold, background class
+    /// and all, exactly as [`classify_chunks`](crate::infer::Classifier::classify_chunks)
+    /// reports it — and a label is predicted once enough chunks vote for it.
+    /// Single-label predicts the label with the most votes, if it has enough;
+    /// ties go to the higher reduced score.
+    ///
+    /// This is the rule that finds one relevant sentence in a long document
+    /// ([#14](https://github.com/jcorrie/burn-setfit/issues/14)). Decoding after
+    /// reduction compares the label's best chunk with the background's best
+    /// chunk, and over a long document the background's best chunk is always
+    /// strong; deciding per chunk asks instead whether *any one* passage prefers
+    /// the label. Measured on the real checkpoint it needs small windows — at
+    /// 64 tokens it got a planted sentence and its control both right at the
+    /// default threshold, at 256 it did not (README, long-document section).
+    ///
+    /// [`Prediction::scores`](crate::infer::Prediction::scores) are still the
+    /// reducer's, so a predicted label need not have the highest score.
+    ///
+    /// ```
+    /// use burn_setfit::ClassifierConfig;
+    /// use std::num::NonZeroUsize;
+    ///
+    /// let config = ClassifierConfig::new(["billing", "outage", "other"])
+    ///     .multi_label()
+    ///     .with_background_class("other")?
+    ///     .with_chunk_votes(NonZeroUsize::MIN); // any one chunk will do
+    ///
+    /// assert_eq!(config.chunk_votes, Some(NonZeroUsize::MIN));
+    /// # Ok::<(), burn_setfit::SetFitError>(())
+    /// ```
+    pub fn with_chunk_votes(mut self, min_chunks: NonZeroUsize) -> Self {
+        self.chunk_votes = Some(min_chunks);
+        self
     }
 
     /// The background label's name, if one is set.
@@ -262,7 +311,8 @@ impl ClassifierConfig {
             // decision and the classifier has nothing to choose between.
             if self.labels.len() < 3 {
                 return Err(SetFitError::Config(format!(
-                    "a background class needs at least two other labels to sit against,                      but {:?} leaves only {}",
+                    "a background class needs at least two other labels to sit against, \
+                     but {:?} leaves only {}",
                     self.labels,
                     self.labels.len() - 1
                 )));
