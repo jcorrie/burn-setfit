@@ -312,7 +312,9 @@ let classifier = Classifier::from_bundle(&bundle, device)?
 ```
 
 Each chunk is decoded exactly as `classify_chunks` reports it, and a label is
-predicted once at least that many chunks name it. It is decode-time, so it can
+predicted once at least that many chunks name it. Measured on the real model,
+`with_chunk_votes(1)` predicts billing for the signal document and nothing
+for the control at 64-token windows, and nothing for either at 128 or 256. It is decode-time, so it can
 be set on a trained model, or stored in the config with
 `ClassifierConfig::with_chunk_votes`. Two open questions stay with #14: which
 window to default to when a background class is set (64 worked on one planted
