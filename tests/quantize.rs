@@ -87,9 +87,29 @@ fn f16_barely_moves_the_scores_and_int8_moves_them_more() {
         int8_drift < 1e-2,
         "int8 drifted {int8_drift}, far enough to suggest a bug rather than precision loss"
     );
+
+    // The ordering is checked on embeddings, not scores. A trained toy head
+    // can saturate its softmax, and near 0 or 1 a score barely moves whatever
+    // the weights do: one CI run saw int8 move the scores by 6e-8 and f16 by
+    // 5e-6, which says nothing about either. Embeddings are L2-normalised and
+    // never saturate, so there the coarser rounding reliably shows.
+    let sentences = ["a b c a", "x y z x", "a x b y c z"];
+    let embed = |q| classifier(q).embed(&sentences).expect("embeds");
+    let reference = embed(Quantization::None);
+    let embed_drift = |q| {
+        reference
+            .iter()
+            .zip(&embed(q))
+            .map(|(a, b)| drift(a, b))
+            .fold(0.0f32, f32::max)
+    };
+    let (f16_embed, int8_embed) = (
+        embed_drift(Quantization::F16),
+        embed_drift(Quantization::Int8),
+    );
     assert!(
-        f16_drift <= int8_drift,
-        "f16 ({f16_drift}) should not drift further than int8 ({int8_drift})"
+        f16_embed < int8_embed,
+        "f16 embeddings ({f16_embed}) should drift less than int8 ({int8_embed})"
     );
 }
 
