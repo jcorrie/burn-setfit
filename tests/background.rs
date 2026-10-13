@@ -9,8 +9,9 @@
 mod common;
 use burn_setfit::config::ClassifierConfig;
 use burn_setfit::head::TaskMode;
-use burn_setfit::infer::{Classifier, decode, decode_against_background};
+use burn_setfit::infer::{Classifier, decide_by_votes, decode, decode_against_background};
 use common::{cpu, small_chunking, toy_bundle, words};
+use std::num::NonZeroUsize;
 
 // ── the decision rule ───────────────────────────────────────────────────────
 
@@ -194,4 +195,167 @@ fn classify_chunks_async_agrees_with_the_blocking_one() {
         assert_eq!(a.scores, b.scores);
         assert_eq!(a.predicted, b.predicted);
     }
+}
+
+// ── deciding per chunk (#14) ────────────────────────────────────────────────
+
+/// Half one vocabulary, half the other, so chunks disagree with each other.
+fn mixed_document() -> String {
+    let a = "a b c a c b ".repeat(20);
+    let x = "x y z z y x ".repeat(20);
+    format!("{a}{x}{a}")
+}
+
+/// How many chunks predict each label on their own, from `classify_chunks`.
+fn votes_from_rows(classifier: &Classifier, text: &str) -> Vec<usize> {
+    let mut votes = vec![0; classifier.labels().len()];
+    for row in classifier.classify_chunks(text).expect("classifies") {
+        for label in row.predicted {
+            votes[label] += 1;
+        }
+    }
+    votes
+}
+
+/// The vote is defined as "rows of `classify_chunks` that name the label", so
+/// the streaming path must count exactly those, at every bar and both modes.
+///
+/// The background is label 1, which the toy model is trained on (the `x y z`
+/// half of the document), so it genuinely outscores the others in some chunks
+/// and a count that ignored it would disagree.
+#[test]
+fn chunk_votes_count_exactly_the_rows_classify_chunks_reports() {
+    let text = mixed_document();
+    for multi in [true, false] {
+        let mut config = ClassifierConfig::new(["alpha", "other", "gamma"]);
+        if multi {
+            config = config.multi_label();
+        }
+        let config = config
+            .with_background_class("other")
+            .expect("label exists")
+            .with_chunking(small_chunking());
+        let bundle = toy_bundle(config);
+
+        for threshold in [0.2, 0.5, 0.8] {
+            let plain = Classifier::from_bundle(&bundle, cpu())
+                .expect("loads")
+                .with_threshold(threshold);
+            let votes = votes_from_rows(&plain, &text);
+            let chunks = plain.classify(&text).expect("classifies").chunks_seen;
+            assert!(chunks > 2, "the document must window into several chunks");
+
+            for min in 1..=chunks + 1 {
+                let min = NonZeroUsize::new(min).unwrap();
+                let voting = Classifier::from_bundle(&bundle, cpu())
+                    .expect("loads")
+                    .with_threshold(threshold)
+                    .with_chunk_votes(Some(min));
+                let got = voting.classify(&text).expect("classifies");
+                let want = decide_by_votes(&votes, &got.scores, voting.cfg().task, min);
+                assert_eq!(
+                    got.predicted, want,
+                    "multi={multi} threshold={threshold} min={min}: votes {votes:?}"
+                );
+                assert!(!got.predicted.contains(&1), "background predicted");
+            }
+        }
+    }
+}
+
+#[test]
+fn more_votes_than_chunks_predicts_nothing() {
+    let config = ClassifierConfig::new(["alpha", "beta"])
+        .multi_label()
+        .with_chunking(small_chunking());
+    let text = mixed_document();
+    // A threshold this low is refused at training, but decoding takes any.
+    let classifier = Classifier::from_bundle(&toy_bundle(config), cpu())
+        .expect("loads")
+        .with_threshold(1e-6);
+    let chunks = classifier.classify(&text).expect("classifies").chunks_seen;
+
+    // At a threshold this low every chunk votes for every label...
+    let every = classifier.with_chunk_votes(NonZeroUsize::new(chunks));
+    assert_eq!(
+        every.classify(&text).expect("classifies").predicted,
+        vec![0, 1]
+    );
+
+    // ...and one vote short of impossible is still impossible.
+    let beyond = every.with_chunk_votes(NonZeroUsize::new(chunks + 1));
+    assert!(
+        beyond
+            .classify(&text)
+            .expect("classifies")
+            .predicted
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_single_label_vote_without_a_background_is_a_majority() {
+    // Every chunk names some label, so the most-voted one always has a vote.
+    let config = ClassifierConfig::new(["alpha", "beta"]).with_chunking(small_chunking());
+    let text = mixed_document();
+    let classifier = Classifier::from_bundle(&toy_bundle(config), cpu())
+        .expect("loads")
+        .with_chunk_votes(Some(NonZeroUsize::MIN));
+    let votes = votes_from_rows(&classifier, &text);
+    let got = classifier.classify(&text).expect("classifies").predicted;
+    assert_eq!(got.len(), 1);
+    assert!(
+        votes.iter().all(|&v| v <= votes[got[0]]),
+        "{got:?} lacks the most votes in {votes:?}"
+    );
+}
+
+#[test]
+fn chunk_votes_survive_the_bundle_and_are_absent_when_unset() {
+    let base = ClassifierConfig::new(["alpha", "beta", "other"])
+        .multi_label()
+        .with_background_class("other")
+        .expect("label exists")
+        .with_chunking(small_chunking());
+
+    let json = serde_json::to_string(&base).expect("serialises");
+    assert!(
+        !json.contains("chunk_votes"),
+        "an unset field must not change existing manifests: {json}"
+    );
+    let old: ClassifierConfig =
+        serde_json::from_str(&json).expect("a manifest without the field loads");
+    assert_eq!(old.chunk_votes, None);
+
+    let three = NonZeroUsize::new(3).unwrap();
+    let voting = base.with_chunk_votes(three);
+    let classifier = Classifier::from_bundle(&toy_bundle(voting), cpu()).expect("loads");
+    assert_eq!(classifier.cfg().chunk_votes, Some(three));
+    assert_eq!(classifier.with_chunk_votes(None).cfg().chunk_votes, None);
+}
+
+#[test]
+fn zero_votes_is_not_representable() {
+    // "Predict a label no chunk voted for" would predict every label; the type
+    // refuses it rather than validation having to.
+    assert!(NonZeroUsize::new(0).is_none());
+    let one = NonZeroUsize::MIN;
+    assert_eq!(
+        decide_by_votes(&[0, 0], &[0.9, 0.1], TaskMode::multi_label(), one),
+        Vec::<usize>::new()
+    );
+    assert!(decide_by_votes(&[0, 0], &[0.9, 0.1], TaskMode::SingleLabel, one).is_empty());
+}
+
+#[test]
+fn single_label_vote_ties_go_to_the_higher_reduced_score() {
+    let two = NonZeroUsize::new(2).unwrap();
+    assert_eq!(
+        decide_by_votes(&[3, 3, 1], &[0.2, 0.5, 0.3], TaskMode::SingleLabel, two),
+        vec![1]
+    );
+    assert_eq!(
+        decide_by_votes(&[3, 3, 1], &[0.6, 0.1, 0.3], TaskMode::SingleLabel, two),
+        vec![0]
+    );
 }

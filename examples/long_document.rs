@@ -179,6 +179,24 @@ fn evaluate(
         let (sb, sn) = votes(signal_doc)?;
         let (cb, cn) = votes(control_doc)?;
         println!("  chunks that decode to billing, signal / control:        {sb}/{sn} / {cb}/{cn}");
+        // The same rule as a decode mode (#14): a label any one chunk prefers
+        // to the background is predicted.
+        let voting = Classifier::from_bundle(bundle, Default::default())?
+            .with_reducer(reducer)
+            .with_chunk_votes(Some(std::num::NonZeroUsize::MIN));
+        let by_votes = |doc: &str| -> Result<Vec<String>, Box<dyn std::error::Error>> {
+            let prediction = voting.classify(doc)?;
+            Ok(prediction
+                .labels(voting.manifest())
+                .into_iter()
+                .map(String::from)
+                .collect())
+        };
+        println!(
+            "  with_chunk_votes(1) predicts: {:?}   control: {:?}",
+            by_votes(signal_doc)?,
+            by_votes(control_doc)?
+        );
         // The direct test of per-chunk competition: in each document's most
         // billing-like chunk, does billing beat the background?
         let b = background.unwrap_or(0);

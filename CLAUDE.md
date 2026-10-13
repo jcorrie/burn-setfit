@@ -11,7 +11,7 @@ Read `README.md` for what the crate does and why. This file is for working on it
 cargo test --features ndarray,train,native
 ```
 
-185 tests, a few seconds, no network. Stay in this loop. Anything touching
+191 tests, a few seconds, no network. Stay in this loop. Anything touching
 `--ignored` or the examples downloads ~90 MB of MiniLM and trains, so it is slow
 and a poor fit for a constrained connection.
 
@@ -221,6 +221,7 @@ See [issues](https://github.com/jcorrie/burn-setfit/issues). #12 holds what
 needs the real checkpoint. Its first two items now run on CI (the `--ignored`
 matrix check on every PR, quantization through the Measure workflow). What
 remains is long documents: a fixed threshold needs calibrating per model, and
-the background class cannot be compared at document level (see the README's
-long-document section). And the real model has still never been fetched into
-the browser harness.
+the background class only works decided per chunk in small windows
+(`with_chunk_votes`, #14, which still has to settle a default window and how
+many votes to ask for; see the README's long-document section). The real model
+reaches the browser harness only through the Measure workflow.

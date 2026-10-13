@@ -29,7 +29,7 @@ verified, and what is not, matters more than a version number here:
 | **Run on software Vulkan only** | `wgpu` — the suite passes on Mesa's lavapipe (`llvmpipe`, `device_type: Cpu`), which exercises the whole backend but is not hardware ([#5]). |
 | **Run in a headless browser on a software GPU only** | `wgpu` on `wasm32`, i.e. WebGPU in a browser. Needs an explicit opt-in — see [Features](#features). The excel-embed add-in trained, packed and classified through it in headless Chromium on SwiftShader (a software Vulkan), with losses matching `ndarray`. Never on real GPU hardware, and never in Safari. |
 | **Reported, not reproduced here** | The real model in a real browser: the maintainer runs this client-side in an Excel add-in on `NdArray` ([#1]). The repository's own harness still only drives a 146 KB stand-in. |
-| **Known limitation** | Long-document classification separates signal from filler only with multi-label `MaxLogits`, and only once the threshold is calibrated; a background class does not help ([below](#a-measured-limitation), #12). |
+| **Known limitation** | Long-document classification separates signal from filler with multi-label `MaxLogits` once the threshold is calibrated, or with a background class decided per chunk in small windows; decoding against a background class after reduction does not help ([below](#a-measured-limitation), #12, #14). |
 
 Open work is tracked in [issues](https://github.com/jcorrie/burn-setfit/issues);
 #12 holds what still needs the real checkpoint.
@@ -185,8 +185,7 @@ cargo test --doc --features ndarray,train,native
 | `tests/error.rs` | That one error type crosses the crate, and that a message names the culprit |
 | `tests/async_api.rs` | That the `_async` methods and their blocking wrappers agree exactly |
 | `tests/quantize.rs` | That every precision round-trips, shrinks, and stays close to fp32 |
-| `tests/background.rs` | The background-class decision rule, and per-chunk output |
-| `tests/wgpu.rs` | The `wgpu` backend against `ndarray` (needs the feature) |
+| `tests/background.rs` | The background-class decision rule, per-chunk output, and deciding by chunk votes |
 | `tests/wgpu.rs` | That the `wgpu` backend runs at all, and agrees with `ndarray` (needs `--features wgpu`) |
 | `tests/tokenize.rs` | Encoding, batching, and that tokenizer-level padding stays stripped |
 | `tests/pretrained.rs` | Fidelity against the real checkpoint (network; `--ignored`) |
@@ -303,16 +302,30 @@ in smaller windows (windowing happens only at inference):
 
 At 64 tokens, deciding *per chunk* against the background gets both documents
 right at the default threshold, and without any calibration. The
-document-level decode this crate implements still predicts nothing there
-(*other*'s best chunk scores 0.91), so the working rule — "a label is predicted
-if some chunk prefers it to the background" — is not yet a decode mode; until
-it is, `classify_chunks` plus `decode_against_background` per chunk does it by
-hand. Plain multi-label `MaxLogits` also separates better at 64 tokens (+0.33
+document-level decode still predicts nothing there (*other*'s best chunk
+scores 0.91). The working rule — "a label is predicted if some chunk prefers it
+to the background" — is a decode mode, `with_chunk_votes` (#14):
+
+```rust
+let classifier = Classifier::from_bundle(&bundle, device)?
+    .with_chunk_votes(Some(NonZeroUsize::MIN)); // any one chunk will do
+```
+
+Each chunk is decoded exactly as `classify_chunks` reports it, and a label is
+predicted once at least that many chunks name it. It is decode-time, so it can
+be set on a trained model, or stored in the config with
+`ClassifierConfig::with_chunk_votes`. Two open questions stay with #14: which
+window to default to when a background class is set (64 worked on one planted
+sentence, 128 did not), and whether one chunk is too eager on real documents —
+raising the count is the knob for that.
+
+Plain multi-label `MaxLogits` also separates better at 64 tokens (+0.33
 against +0.19 at 256), with a wider threshold window (0.57 – 0.90).
 
-The decision rule itself is exact and pinned by `tests/background.rs`. It gives a
-single-label head somewhere to abstain *to*, and it suits inputs whose chunks
-are mostly on-topic. One sentence in a long document needs small windows and a
+The decision rules are exact and pinned by `tests/background.rs`, including
+that the vote counts exactly the rows `classify_chunks` reports. The
+background class gives a single-label head somewhere to abstain *to*, and it
+suits inputs whose chunks are mostly on-topic. One sentence in a long document needs small windows and a
 per-chunk decision, or a calibrated threshold.
 
 ### Per-chunk output
