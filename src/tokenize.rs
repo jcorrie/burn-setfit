@@ -125,8 +125,29 @@ pub fn pad_batch(
     pad_id: u32,
     device: &Device,
 ) -> (Tensor<2, Int>, Tensor<2>) {
-    let batch_size = sequences.len();
     let max_len = sequences.iter().map(|s| s.len()).max().unwrap_or(0);
+    pad_batch_to(sequences, pad_id, max_len, device)
+}
+
+/// [`pad_batch`], padded to at least `len` columns rather than exactly the
+/// longest sequence.
+///
+/// The padding is masked out, so it changes no output. What it buys is fewer
+/// distinct shapes: a GPU backend compiles kernels per shape, and rounding
+/// lengths up to a few buckets keeps that to a handful.
+pub fn pad_batch_to(
+    sequences: &[Vec<u32>],
+    pad_id: u32,
+    len: usize,
+    device: &Device,
+) -> (Tensor<2, Int>, Tensor<2>) {
+    let batch_size = sequences.len();
+    let max_len = sequences
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        .max(len);
 
     let mut ids = vec![pad_id as i64; batch_size * max_len];
     let mut mask = vec![0.0f32; batch_size * max_len];

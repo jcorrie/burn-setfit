@@ -83,6 +83,23 @@ fn classifying_on_wgpu_agrees_with_ndarray() {
 }
 
 #[test]
+fn classifying_many_on_wgpu_matches_one_at_a_time() {
+    // Padded passes of mixed lengths are where a backend's masking would show:
+    // a short document padded beside a long one must score as it does alone.
+    let gpu = Classifier::from_bundle(&toy_bundle(config()), gpu()).expect("loads on wgpu");
+    let docs = ["a b c".to_string(), words(200), words(9), String::new()];
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+
+    let many = gpu.classify_many(&refs).expect("classifies on wgpu");
+    for (doc, got) in docs.iter().zip(&many) {
+        let alone = gpu.classify(doc).expect("classifies on wgpu");
+        assert_close(&alone.scores, &got.scores, "scores");
+        assert_eq!(alone.predicted, got.predicted, "predicted labels");
+        assert_eq!(alone.chunks_seen, got.chunks_seen, "chunks");
+    }
+}
+
+#[test]
 fn embedding_on_wgpu_agrees_with_ndarray() {
     let bundle = toy_bundle(config());
     let texts = ["a b c", "x y z"];
