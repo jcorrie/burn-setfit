@@ -295,7 +295,9 @@ fn bench_infer(fx: &Fixture) -> Res<()> {
     let base = fx.classifier(module, ChunkConfig::default())?;
     for words in [200, 5_000] {
         let doc = document(&fx.words, words, 11);
-        for batch in [8, 32] {
+        // 16 is where Metal's per-sequence cost bottoms out in the forward
+        // table; whether classify sees the same is what this row answers.
+        for batch in [1, 8, 16, 32] {
             let classifier = fx.classifier(
                 SetFitModule::init(&minilm_l6_config(), fx.labels.len(), &fx.device),
                 ChunkConfig::default(),

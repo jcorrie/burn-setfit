@@ -76,9 +76,17 @@ counts, not by weight values. What it found, on a 4-core x86 sandbox:
   ~1.5x on the forward pass; in Chromium at MiniLM size, built with
   `-C target-feature=+simd128`, 2.7x on training and 3.2x on classification.
   It is a feature, not the default, until the browser binding moves to it.
-- **CPU throughput per sequence does not improve with batch size.** Batching
-  only buys padding there; on a GPU it is expected to matter, and that is the
-  first thing to measure on one.
+- **Batch size matters on a GPU and barely on a CPU.** On Metal (Apple M5,
+  `--wgpu`), a 256-token forward costs 15.8 ms/sequence alone, 7.8 at batch 8
+  and 4.5 at batch 16, and no less at 32. `flex` on the same machine gains 7%
+  from 8 to 16; ndarray on the x86 sandbox gains nothing. The forward table
+  argues for a default above 8 on a GPU, but end-to-end `classify` at batch 32
+  was no faster than at 8 (252 vs 272 ms for 37 chunks), so the default stays
+  until the batch-16 row says otherwise.
+- **On an M5, Metal is ~3x `flex`, and `flex` is ~13x the x86 sandbox.**
+  Long-document classify: 6.8 ms/chunk on Metal, 15.9 on `flex`. A body step:
+  86 ms on Metal, 203 on `flex`. The first non-autodiff forward on Metal costs
+  ~400 ms of kernel compilation (the body-to-head step), once.
 - **A body step is ~1/3 forward, ~1/3 backward, ~1/3 AdamW**, and three
   quarters of AdamW is the 30522x384 word-embedding table. Freezing it was
   measured at -20% per step natively but only -11% in a browser, where steps
