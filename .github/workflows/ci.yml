@@ -51,6 +51,9 @@ jobs:
           shared-key: test
       # Unit, integration and doc tests; also compiles every example.
       - run: cargo test --locked --workspace --features $FEATURES
+      # `flex` implements fused attention as a kernel of its own; the unit
+      # tests are where the encoder is checked against Burn's on it.
+      - run: cargo test --locked --lib --features $FEATURES,flex
 
   msrv:
     name: MSRV (1.95)
@@ -81,6 +84,9 @@ jobs:
       # The one configuration where a blocking readback is a failure, not a slow path.
       - name: wgpu-wasm-unverified
         run: cargo build --locked --target wasm32-unknown-unknown --no-default-features --features wgpu-wasm-unverified,train
+      # Opt-in for now, and the fastest CPU backend in a browser by ~3x.
+      - name: flex
+        run: cargo build --locked --target wasm32-unknown-unknown --no-default-features --features flex,train
       - name: setfit-wasm (release)
         run: cargo build --locked --release --target wasm32-unknown-unknown -p setfit-wasm
 

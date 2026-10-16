@@ -19,7 +19,9 @@ and a poor fit for a constrained connection.
 cargo clippy --all-targets --features ndarray,train,native   # expected: zero warnings
 cargo build --target wasm32-unknown-unknown --no-default-features --features ndarray,train
 cargo build --target wasm32-unknown-unknown --no-default-features --features wgpu-wasm-unverified,train
+cargo build --target wasm32-unknown-unknown --no-default-features --features flex,train
 cargo build --release --target wasm32-unknown-unknown -p setfit-wasm
+cargo test --lib --features ndarray,train,native,flex   # the encoder checked on flex's fused attention
 ```
 
 The `wgpu` backend has its own suite, kept out of the default run because it
@@ -53,6 +55,37 @@ the only configuration where a blocking readback is a real failure rather than a
 slow one, so it catches an `into_data()` that crept back in. It has never been
 executed on a GPU — the feature's name is load-bearing, do not rename it to
 something reassuring.
+
+## Performance
+
+```bash
+cargo run --release --example bench                          # ndarray, every stage
+cargo run --release --example bench --features flex -- --flex
+cargo run --release --example bench --features wgpu -- --wgpu  # Metal on a Mac
+cargo run --release --example bench -- train                 # one stage by name
+```
+
+Random weights in MiniLM-L6's exact shapes, so it runs offline and times what
+the real checkpoint would: every cost here is decided by shapes and token
+counts, not by weight values. What it found, on a 4-core x86 sandbox:
+
+- **The encoder is the whole bill.** Chunking a document runs at ~2 MB/s,
+  ~0.2% of classifying it. Inside the encoder, ndarray spends nearly as long on
+  softmax and erf (scalar, single-threaded `mapv`) as on every matmul.
+- **`flex` is the faster CPU backend, by far the most in a browser.** Natively
+  ~1.5x on the forward pass; in Chromium at MiniLM size, built with
+  `-C target-feature=+simd128`, 2.7x on training and 3.2x on classification.
+  It is a feature, not the default, until the browser binding moves to it.
+- **CPU throughput per sequence does not improve with batch size.** Batching
+  only buys padding there; on a GPU it is expected to matter, and that is the
+  first thing to measure on one.
+- **A body step is ~1/3 forward, ~1/3 backward, ~1/3 AdamW**, and three
+  quarters of AdamW is the 30522x384 word-embedding table. Freezing it was
+  measured at -20% per step natively but only -11% in a browser, where steps
+  are compute-bound; it changes what is trained, so it is not done.
+- **At real size a body step blocks a browser's main thread for 1–3 s.** The
+  harness's 250 ms frame budget holds for the toy body only; a real deployment
+  wants training in a Web Worker.
 
 ## CI
 
@@ -166,6 +199,23 @@ test names are given so a failure is self-explaining.
   fall-through in `step_async` for that reason, with the epoch bookkeeping
   pulled out into `body_epoch_rollover` so it happens before any future exists.
   Guard: `tests/async_api.rs::step_async_crosses_the_body_to_head_boundary`.
+
+- **Fused attention has no attention dropout.** `MiniLmLayer::attend` calls
+  `module::attention`, which `flex` and the GPU backends run as one kernel, but
+  the op cannot drop attention weights, and training does. So it is used only
+  off autodiff, where Burn's dropout is the identity anyway; training still
+  goes through `MultiHeadAttention::forward`. Using the fused op on an autodiff
+  device would silently stop regularising the body.
+  Guard: `minilm::encoder::tests::loads_burns_encoder_weights_and_agrees_with_it`
+  (and its `flex` twin) for the inference side.
+
+- **Inference regroups chunks by length, and must fold them back in order.**
+  `forward_window` sorts a few batches of chunks by length before encoding, to
+  stop padding to the longest of a batch costing ~20% of the encoder. The
+  hierarchical reducer groups *consecutive* chunks, so scores are folded in
+  document order, never in batch order.
+  Guards: `tests/infer.rs::per_chunk_output_is_the_same_whatever_the_batch_size`,
+  `tests/infer.rs::batch_size_does_not_change_the_verdict`.
 
 ## Conventions
 

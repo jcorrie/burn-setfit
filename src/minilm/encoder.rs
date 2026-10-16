@@ -26,6 +26,8 @@ use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig
 use burn::nn::{
     Dropout, DropoutConfig, Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig,
 };
+use burn::tensor::module::attention;
+use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Bool, Device, Tensor};
 
 /// Encoder stack configuration.
@@ -136,14 +138,59 @@ impl MiniLmEncoder {
 
 impl MiniLmLayer {
     fn forward(&self, x: Tensor<3>, mask_pad: Tensor<2, Bool>) -> Tensor<3> {
-        let attended = self
-            .mha
-            .forward(MhaInput::self_attn(x.clone()).mask_pad(mask_pad))
-            .context;
+        let attended = self.attend(x.clone(), mask_pad);
         let x = self.norm_1.forward(x + self.dropout.forward(attended));
 
         let fed = self.pwff.forward(x.clone());
         self.norm_2.forward(x + self.dropout.forward(fed))
+    }
+
+    /// Self-attention, through Burn's fused attention op wherever it may be.
+    ///
+    /// `module::attention` is one call a backend can implement as a single
+    /// kernel — `flex` and the cubecl GPU backends do — instead of the full
+    /// passes over a `[batch, heads, seq, seq]` score tensor that
+    /// `MultiHeadAttention::forward` makes one after another (scale, mask, then
+    /// softmax's max, subtract, exp, sum, divide). On ndarray at 256 tokens
+    /// those passes cost about as much as every matmul in the layer combined;
+    /// ndarray itself still decomposes the op, so it gains nothing here.
+    ///
+    /// The op has no dropout on the attention weights, and training applies
+    /// it, so a forward on an autodiff device still goes through
+    /// `MultiHeadAttention::forward` and trains exactly what it always has.
+    /// Off autodiff, Burn's dropout is the identity, so the two compute the
+    /// same function: same projections, same `1/√d_k` scale, and a padded key
+    /// filled with `-inf` rather than `min_float` reaches the same zero weight.
+    /// `loads_burns_encoder_weights_and_agrees_with_it` holds the two together.
+    fn attend(&self, x: Tensor<3>, mask_pad: Tensor<2, Bool>) -> Tensor<3> {
+        if x.device().is_autodiff() {
+            return self
+                .mha
+                .forward(MhaInput::self_attn(x).mask_pad(mask_pad))
+                .context;
+        }
+
+        let mha = &self.mha;
+        let [batch, seq, d_model] = x.dims();
+        let heads = |linear: &Linear| {
+            linear
+                .forward(x.clone())
+                .reshape([batch, seq, mha.n_heads, mha.d_k])
+                .swap_dims(1, 2)
+        };
+        let mask = mask_pad
+            .reshape([batch, 1, 1, seq])
+            .expand([batch, mha.n_heads, seq, seq]);
+        let context = attention(
+            heads(&mha.query),
+            heads(&mha.key),
+            heads(&mha.value),
+            Some(mask),
+            None,
+            AttentionModuleOptions::default(),
+        );
+        mha.output
+            .forward(context.swap_dims(1, 2).reshape([batch, seq, d_model]))
     }
 }
 
@@ -249,10 +296,26 @@ mod tests {
     /// replacement rather than a different model.
     #[test]
     fn loads_burns_encoder_weights_and_agrees_with_it() {
+        agrees_with_burns_encoder(cpu(), 1e-5);
+    }
+
+    /// `flex` implements `module::attention` as a kernel of its own rather
+    /// than ndarray's decomposition, so the fused path is only actually tested
+    /// on a backend like this one. Looser than the ndarray check because the
+    /// kernel sums in its own order.
+    #[cfg(feature = "flex")]
+    #[test]
+    fn fused_attention_on_flex_agrees_with_burns_encoder() {
+        agrees_with_burns_encoder(Device::flex(), 1e-4);
+    }
+
+    /// Burn's `TransformerEncoder` on ndarray as the reference, this crate's
+    /// encoder on `device`, with one padded row so the mask is exercised.
+    fn agrees_with_burns_encoder(device: Device, tolerance: f32) {
         use burn::nn::transformer::{TransformerEncoderConfig, TransformerEncoderInput};
         use burn_store::{ModuleSnapshot, SafetensorsStore};
 
-        let device = cpu();
+        let reference_device = cpu();
         let (d_model, d_ff, heads, layers) = (16, 32, 2, 2);
         let initializer = Initializer::KaimingUniform {
             gain: 1.0 / 3.0f64.sqrt(),
@@ -263,7 +326,7 @@ mod tests {
             .with_dropout(0.0)
             .with_norm_first(false)
             .with_initializer(initializer.clone())
-            .init(&device);
+            .init(&reference_device);
         let mut store = SafetensorsStore::from_bytes(None);
         reference.save_into(&mut store).expect("saves");
         let bytes = store.get_bytes().expect("serialises");
@@ -274,15 +337,17 @@ mod tests {
         ours.load_from(&mut store)
             .expect("every one of Burn's paths has a home");
 
-        let x = Tensor::<3>::random([2, 5, d_model], Default::default(), &device);
-        let mask =
-            Tensor::<2, Bool>::from_data([[false, false, false, true, true], [false; 5]], &device);
+        let x = Tensor::<3>::random([2, 5, d_model], Default::default(), &reference_device);
+        let mask = Tensor::<2, Bool>::from_data(
+            [[false, false, false, true, true], [false; 5]],
+            &reference_device,
+        );
         let want = floats(
             reference.forward(TransformerEncoderInput::new(x.clone()).mask_pad(mask.clone())),
         );
-        let got = floats(ours.forward(x, mask));
+        let got = floats(ours.forward(x.to_device(&device), mask.to_device(&device)));
         for (i, (w, g)) in want.iter().zip(&got).enumerate() {
-            assert!((w - g).abs() < 1e-5, "element {i}: Burn {w}, ours {g}");
+            assert!((w - g).abs() < tolerance, "element {i}: Burn {w}, ours {g}");
         }
     }
 }
