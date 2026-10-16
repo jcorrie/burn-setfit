@@ -263,6 +263,13 @@ fn bench_forward(fx: &Fixture) -> Res<()> {
         (8, 256),
         (16, 256),
         (32, 256),
+        // Real batches are padded to their longest chunk, which is rarely a
+        // round number. 248 is a multiple of 8 and 251 is not; if a GPU's
+        // kernels care about alignment, these rows show it against 256.
+        (8, 251),
+        (16, 248),
+        (16, 251),
+        (32, 251),
     ] {
         let seqs: Vec<Vec<u32>> = (0..batch)
             .map(|b| {
@@ -295,7 +302,9 @@ fn bench_infer(fx: &Fixture) -> Res<()> {
     let base = fx.classifier(module, ChunkConfig::default())?;
     for words in [200, 5_000] {
         let doc = document(&fx.words, words, 11);
-        for batch in [8, 32] {
+        // 16 is where Metal's per-sequence cost bottoms out in the forward
+        // table; whether classify sees the same is what this row answers.
+        for batch in [1, 8, 16, 32] {
             let classifier = fx.classifier(
                 SetFitModule::init(&minilm_l6_config(), fx.labels.len(), &fx.device),
                 ChunkConfig::default(),

@@ -76,9 +76,24 @@ counts, not by weight values. What it found, on a 4-core x86 sandbox:
   ~1.5x on the forward pass; in Chromium at MiniLM size, built with
   `-C target-feature=+simd128`, 2.7x on training and 3.2x on classification.
   It is a feature, not the default, until the browser binding moves to it.
-- **CPU throughput per sequence does not improve with batch size.** Batching
-  only buys padding there; on a GPU it is expected to matter, and that is the
-  first thing to measure on one.
+- **Batch size matters to one forward on a GPU, but not to `classify`.** On
+  Metal (Apple M5, `--wgpu`), a 256-token forward costs 15.8 ms/sequence
+  alone, 7.6 at batch 8 and 4.2 at batch 16, and no less at 32. End to end,
+  a 37-chunk document classifies in 499 ms at batch 1 and ~245 ms at 8, 16
+  or 32 alike, so the default stays at 8, which holds the least in memory.
+  `flex` on the same machine gains 7% from 8 to 16; ndarray on the x86
+  sandbox gains nothing.
+- **Unaligned lengths are a cliff on Metal.** 16 x 251 tokens took 144 ms
+  against 76 ms for 16 x 248. Classify used to pad each batch to its longest
+  chunk, nearly always an odd length, which made batch 16 and 32 *slower*
+  than 8 (264 and 272 ms against 249). Batches are now padded to a multiple
+  of `LENGTH_BUCKET` (8), as `classify_many` already did: 242 and 243 ms.
+  `embed` and training batches still pad to the exact longest; short
+  sentences are where rounding up costs a CPU the most.
+- **On an M5, Metal is ~3x `flex`, and `flex` is ~13x the x86 sandbox.**
+  Long-document classify: 6.8 ms/chunk on Metal, 15.9 on `flex`. A body step:
+  86 ms on Metal, 203 on `flex`. The first non-autodiff forward on Metal costs
+  ~400 ms of kernel compilation (the body-to-head step), once.
 - **A body step is ~1/3 forward, ~1/3 backward, ~1/3 AdamW**, and three
   quarters of AdamW is the 30522x384 word-embedding table. Freezing it was
   measured at -20% per step natively but only -11% in a browser, where steps
