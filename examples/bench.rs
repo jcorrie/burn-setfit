@@ -263,6 +263,13 @@ fn bench_forward(fx: &Fixture) -> Res<()> {
         (8, 256),
         (16, 256),
         (32, 256),
+        // Real batches are padded to their longest chunk, which is rarely a
+        // round number. 248 is a multiple of 8 and 251 is not; if a GPU's
+        // kernels care about alignment, these rows show it against 256.
+        (8, 251),
+        (16, 248),
+        (16, 251),
+        (32, 251),
     ] {
         let seqs: Vec<Vec<u32>> = (0..batch)
             .map(|b| {

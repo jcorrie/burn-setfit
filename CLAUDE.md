@@ -80,9 +80,11 @@ counts, not by weight values. What it found, on a 4-core x86 sandbox:
   `--wgpu`), a 256-token forward costs 15.8 ms/sequence alone, 7.8 at batch 8
   and 4.5 at batch 16, and no less at 32. `flex` on the same machine gains 7%
   from 8 to 16; ndarray on the x86 sandbox gains nothing. The forward table
-  argues for a default above 8 on a GPU, but end-to-end `classify` at batch 32
-  was no faster than at 8 (252 vs 272 ms for 37 chunks), so the default stays
-  until the batch-16 row says otherwise.
+  argues for a default above 8 on a GPU, but end-to-end `classify` does not
+  follow it: 249, 264 and 272 ms at batch 8, 16 and 32 for 37 chunks, so the
+  default stays at 8. The table pads nothing and runs exactly 256 tokens;
+  classify's batches are padded to odd lengths like 237 or 251. The rows at
+  248 and 251 tokens test whether that is the gap.
 - **On an M5, Metal is ~3x `flex`, and `flex` is ~13x the x86 sandbox.**
   Long-document classify: 6.8 ms/chunk on Metal, 15.9 on `flex`. A body step:
   86 ms on Metal, 203 on `flex`. The first non-autodiff forward on Metal costs
