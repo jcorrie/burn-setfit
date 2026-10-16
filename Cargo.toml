@@ -32,6 +32,11 @@ default = ["ndarray", "train", "native"]
 # Backends
 ndarray = ["burn/ndarray"]
 wgpu    = ["burn/wgpu"]
+# Burn's successor to `ndarray`: SIMD kernels (NEON, AVX2, wasm SIMD128) and
+# `gemm` for matmul. Opt-in for now: it builds for wasm32 and has passed the
+# browser harness by hand (with `-C target-feature=+simd128`), but the browser
+# binding still runs `ndarray`. See CLAUDE.md, "Performance", for what it buys.
+flex    = ["burn/flex", "burn/simd"]
 
 # Opt in to `wgpu` on wasm32, which is refused without it. The combination
 # compiles and the async API it needs exists, but it has never been executed on

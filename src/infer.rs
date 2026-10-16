@@ -23,6 +23,18 @@ use core::ops::Range;
 /// Larger batches amortise the encoder better, at proportionally more peak memory.
 pub const DEFAULT_BATCH_SIZE: usize = 8;
 
+/// How many batches' worth of chunks are gathered before any is encoded.
+///
+/// Every row in a batch is padded to the longest one, and the encoder computes
+/// over the padding as if it were content. Chunks end on sentence and paragraph
+/// boundaries, so their lengths vary — consecutive chunks batched as they come
+/// spend about a fifth of the encoder's work on padding. Gathering a few
+/// batches first and grouping them by length recovers most of that, and costs
+/// nothing but the token ids of a few more chunks held at once; the encoder
+/// still sees one batch at a time. Results are folded back in document order,
+/// so the hierarchical reducer, which groups *consecutive* chunks, is unaffected.
+const LOOKAHEAD_BATCHES: usize = 4;
+
 /// Most chunks in one forward pass of [`Classifier::classify_many`].
 ///
 /// Many short documents are what that method is for, and a short document is
@@ -313,8 +325,8 @@ impl Classifier {
     /// Classify a document arriving in pieces.
     ///
     /// The source is consumed lazily and may be arbitrarily long: chunks are
-    /// encoded and folded as they are produced, and only the current batch is
-    /// ever resident.
+    /// encoded and folded as they are produced, and only a few batches of
+    /// token ids, and one batch of activations, are ever resident.
     ///
     /// ```no_run
     /// use burn_setfit::Classifier;
@@ -342,17 +354,17 @@ impl Classifier {
     ) -> Result<Prediction> {
         let mut fold = self.new_fold();
         let chunker = Chunker::new(source, &self.tokenizer, self.cfg().chunk);
-        let mut batch: Vec<Chunk> = Vec::with_capacity(self.batch_size);
+        let mut window: Vec<Chunk> = Vec::with_capacity(self.window_size());
 
         for chunk in chunker {
-            batch.push(chunk?);
-            if batch.len() == self.batch_size {
-                self.run_batch(&batch, &mut fold).await?;
-                batch.clear();
+            window.push(chunk?);
+            if window.len() == self.window_size() {
+                self.run_window(&window, &mut fold).await?;
+                window.clear();
             }
         }
-        if !batch.is_empty() {
-            self.run_batch(&batch, &mut fold).await?;
+        if !window.is_empty() {
+            self.run_window(&window, &mut fold).await?;
         }
 
         Ok(self.finish_fold(fold))
@@ -467,30 +479,30 @@ impl Classifier {
         );
 
         let mut out = Vec::new();
-        let mut batch: Vec<Chunk> = Vec::with_capacity(self.batch_size);
+        let mut window: Vec<Chunk> = Vec::with_capacity(self.window_size());
 
         for chunk in chunker {
-            batch.push(chunk?);
-            if batch.len() == self.batch_size {
-                self.push_chunk_predictions(&batch, &mut out).await?;
-                batch.clear();
+            window.push(chunk?);
+            if window.len() == self.window_size() {
+                self.push_chunk_predictions(&window, &mut out).await?;
+                window.clear();
             }
         }
-        if !batch.is_empty() {
-            self.push_chunk_predictions(&batch, &mut out).await?;
+        if !window.is_empty() {
+            self.push_chunk_predictions(&window, &mut out).await?;
         }
 
         Ok(out)
     }
 
-    /// Score one batch and append a row per chunk.
+    /// Score a window of chunks and append a row per chunk, in document order.
     async fn push_chunk_predictions(
         &self,
-        batch: &[Chunk],
+        window: &[Chunk],
         out: &mut Vec<ChunkPrediction>,
     ) -> Result<()> {
-        let rows = self.forward_rows(batch).await?;
-        for (chunk, row) in batch.iter().zip(&rows) {
+        let rows = self.forward_window(window).await?;
+        for (chunk, row) in window.iter().zip(&rows) {
             let scores = to_probabilities(row, self.cfg().task);
             // Decoded per chunk with the same rules the document gets, so a
             // caller comparing the two is comparing like with like.
@@ -506,11 +518,36 @@ impl Classifier {
         Ok(())
     }
 
-    /// Encode one batch of chunks and read their logits back, one row each.
+    /// Chunks gathered before encoding; see [`LOOKAHEAD_BATCHES`].
+    fn window_size(&self) -> usize {
+        self.batch_size * LOOKAHEAD_BATCHES
+    }
+
+    /// Encode a window of chunks in length-sorted batches, and read their
+    /// logits back one row each, in the window's own order.
     ///
     /// The whole device-touching part of inference, shared by the reducing path
     /// and the per-chunk one so they cannot disagree about what a chunk scores.
-    async fn forward_rows(&self, batch: &[Chunk]) -> Result<Vec<Vec<f32>>> {
+    /// Which chunks share a batch changes only how much padding is computed:
+    /// padding is masked out of attention and pooling, so a row's scores do not
+    /// depend on its neighbours.
+    async fn forward_window(&self, window: &[Chunk]) -> Result<Vec<Vec<f32>>> {
+        let mut order: Vec<usize> = (0..window.len()).collect();
+        order.sort_by_key(|&i| window[i].ids.len());
+
+        let mut rows = vec![Vec::new(); window.len()];
+        for group in order.chunks(self.batch_size) {
+            let batch: Vec<&Chunk> = group.iter().map(|&i| &window[i]).collect();
+            let scored = self.forward_rows(&batch).await?;
+            for (&i, row) in group.iter().zip(scored) {
+                rows[i] = row;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Encode one batch of chunks and read their logits back, one row each.
+    async fn forward_rows(&self, batch: &[&Chunk]) -> Result<Vec<Vec<f32>>> {
         let sequences: Vec<Vec<u32>> = batch.iter().map(|c| c.ids.clone()).collect();
         self.forward_sequences(&sequences, 0).await
     }
@@ -535,10 +572,10 @@ impl Classifier {
         Ok(data.chunks(num_labels).map(<[f32]>::to_vec).collect())
     }
 
-    /// Encode one batch of chunks and fold their scores in.
-    async fn run_batch(&self, batch: &[Chunk], fold: &mut DocFold) -> Result<()> {
-        let rows = self.forward_rows(batch).await?;
-        for (chunk, row) in batch.iter().zip(&rows) {
+    /// Encode a window of chunks and fold their scores in, in document order.
+    async fn run_window(&self, window: &[Chunk], fold: &mut DocFold) -> Result<()> {
+        let rows = self.forward_window(window).await?;
+        for (chunk, row) in window.iter().zip(&rows) {
             self.fold_row(fold, chunk, row);
         }
         Ok(())
