@@ -28,7 +28,7 @@ The `wgpu` backend has its own suite, kept out of the default run because it
 needs the feature and a Vulkan adapter:
 
 ```bash
-cargo test --features ndarray,wgpu,train --test wgpu    # 4 tests, ~20 s
+cargo test --features ndarray,wgpu,train --test wgpu    # 5 tests, ~20 s
 ```
 
 No GPU is needed. Mesa's lavapipe (`apt-get install mesa-vulkan-drivers`,
