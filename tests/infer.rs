@@ -132,6 +132,93 @@ fn a_zero_batch_size_is_clamped_rather_than_dividing_by_zero() {
     assert_eq!(got.chunks_seen, 1);
 }
 
+// ── many documents ──────────────────────────────────────────────────────────
+
+/// Documents of every shape: empty, one short chunk, several chunks, and the
+/// same text twice. A different rotation of the alphabet each, so no two
+/// short ones tokenize alike.
+fn assorted_documents() -> Vec<String> {
+    let mut docs = vec![String::new(), words(400), "a b c".to_string()];
+    for i in 0..90 {
+        let rotated: String = words(26 + i % 7)
+            .split(' ')
+            .cycle()
+            .skip(i % 26)
+            .take(3 + i % 11)
+            .collect::<Vec<_>>()
+            .join(" ");
+        docs.push(rotated);
+    }
+    docs.push(words(120));
+    docs.push(words(400));
+    docs
+}
+
+/// `classify_many` is a layout of the work, not a different classifier: each
+/// document must come back as `classify` gives it alone.
+fn assert_many_matches_one_at_a_time(c: &Classifier, docs: &[String]) {
+    let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    let many = c.classify_many(&refs).expect("classifies");
+    assert_eq!(many.len(), docs.len());
+    for (i, (doc, got)) in docs.iter().zip(&many).enumerate() {
+        let alone = c.classify(doc).expect("classifies");
+        assert_eq!(got.predicted, alone.predicted, "document {i}");
+        assert_eq!(got.chunks_seen, alone.chunks_seen, "document {i}");
+        for (a, b) in got.scores.iter().zip(&alone.scores) {
+            assert!((a - b).abs() < 1e-4, "document {i}: {a} vs {b}");
+        }
+        assert_eq!(got.evidence.len(), alone.evidence.len(), "document {i}");
+        for (a, b) in got.evidence.iter().zip(&alone.evidence) {
+            assert_eq!(a.byte_range, b.byte_range, "document {i}");
+            assert_eq!(a.label, b.label, "document {i}");
+        }
+    }
+}
+
+#[test]
+fn classifying_many_matches_classifying_each_alone() {
+    // More short documents than one pass holds, so several passes run.
+    let docs = assorted_documents();
+    assert!(docs.len() > burn_setfit::infer::MANY_MAX_ROWS);
+    assert_many_matches_one_at_a_time(&single_label(), &docs);
+}
+
+#[test]
+fn classifying_many_matches_under_every_decode_option() {
+    // Hierarchy and chunk votes both depend on the order chunks are folded
+    // in, so these are what would catch chunks reaching the wrong document or
+    // arriving out of order.
+    let docs = assorted_documents();
+    let multi = || {
+        classifier(
+            ClassifierConfig::new(["alpha", "beta", "gamma"])
+                .multi_label()
+                .with_chunking(small_chunking()),
+        )
+    };
+    assert_many_matches_one_at_a_time(&multi().with_hierarchy(3), &docs);
+    assert_many_matches_one_at_a_time(
+        &multi().with_chunk_votes(core::num::NonZeroUsize::new(2)),
+        &docs,
+    );
+    assert_many_matches_one_at_a_time(
+        &multi().with_reducer(Reducer::TopKMeanLogits { k: 2 }),
+        &docs,
+    );
+}
+
+#[test]
+fn classifying_no_documents_returns_nothing() {
+    assert!(single_label().classify_many(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn classifying_only_empty_documents_runs_no_pass() {
+    let got = single_label().classify_many(&["", ""]).unwrap();
+    assert_eq!(got.len(), 2);
+    assert!(got.iter().all(|p| p.chunks_seen == 0));
+}
+
 // ── streaming ───────────────────────────────────────────────────────────────
 
 #[test]

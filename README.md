@@ -346,6 +346,21 @@ pass, so a chunk scores the same either way. Note this holds every row in
 memory, unlike `classify_stream`, which folds as it goes; a genuinely unbounded
 input wants that one.
 
+### Many short documents
+
+A forward pass has a large fixed cost, and on a GPU a short text's pass is
+nearly all fixed cost. `classify_many` chunks every document first and runs
+chunks from all of them through shared passes, shortest first (at most 64
+chunks and 4,096 padded tokens per pass):
+
+```rust
+let predictions = classifier.classify_many(&["Refund please", "Where is my parcel?"])?;
+```
+
+Each prediction is the one `classify` gives that document alone; only the
+layout of the work changes. It keeps every chunk's logits until the end, so it
+suits a column of cells, not one unbounded stream.
+
 ## WebAssembly
 
 ```bash

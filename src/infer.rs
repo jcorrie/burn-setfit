@@ -13,7 +13,7 @@ use crate::head::TaskMode;
 use crate::model::SetFitModule;
 use crate::readback::{self, blocking};
 use crate::reduce::{DocAccumulator, Reducer};
-use crate::tokenize::{Tokenizer, pad_batch};
+use crate::tokenize::{Tokenizer, pad_batch, pad_batch_to};
 use burn::tensor::Device;
 use core::num::NonZeroUsize;
 use core::ops::Range;
@@ -22,6 +22,29 @@ use core::ops::Range;
 ///
 /// Larger batches amortise the encoder better, at proportionally more peak memory.
 pub const DEFAULT_BATCH_SIZE: usize = 8;
+
+/// Most chunks in one forward pass of [`Classifier::classify_many`].
+///
+/// Many short documents are what that method is for, and a short document is
+/// one short chunk, so its passes hold far more rows than
+/// [`DEFAULT_BATCH_SIZE`]. [`MANY_MAX_TOKENS`] is what bounds them when the
+/// chunks are long.
+pub const MANY_MAX_ROWS: usize = 64;
+
+/// Most padded tokens (rows × padded length) in one forward pass of
+/// [`Classifier::classify_many`].
+///
+/// Sixteen full 256-token windows, or 64 short ones. Capping by tokens rather
+/// than rows alone is what keeps peak memory flat whatever the mix of lengths.
+pub const MANY_MAX_TOKENS: usize = 4096;
+
+/// [`Classifier::classify_many`] pads each pass to a multiple of this many
+/// tokens.
+///
+/// Padding is masked out, so it changes no score. It bounds how many distinct
+/// shapes the encoder sees, which matters on a GPU backend: each new shape
+/// compiles kernels, and that costs far more than a few padded columns.
+pub const LENGTH_BUCKET: usize = 8;
 
 /// A chunk that contributed strongly to a predicted label.
 ///
@@ -317,52 +340,88 @@ impl Classifier {
         &self,
         source: I,
     ) -> Result<Prediction> {
-        let num_labels = self.cfg().num_labels();
-        let mut accumulator =
-            DocAccumulator::new(self.cfg().reducer, self.cfg().hierarchy_fanout, num_labels);
-        // Tracked per label, because which label matters is not known until the
-        // document is fully reduced. Bounded at limit x labels either way.
-        let mut evidence: Vec<Vec<Evidence>> = vec![Vec::new(); num_labels];
-        // Chunks that predict each label on their own, for `chunk_votes`.
-        let mut votes = vec![0usize; num_labels];
-
+        let mut fold = self.new_fold();
         let chunker = Chunker::new(source, &self.tokenizer, self.cfg().chunk);
         let mut batch: Vec<Chunk> = Vec::with_capacity(self.batch_size);
 
         for chunk in chunker {
             batch.push(chunk?);
             if batch.len() == self.batch_size {
-                self.run_batch(&batch, &mut accumulator, &mut evidence, &mut votes)
-                    .await?;
+                self.run_batch(&batch, &mut fold).await?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            self.run_batch(&batch, &mut accumulator, &mut evidence, &mut votes)
-                .await?;
+            self.run_batch(&batch, &mut fold).await?;
         }
 
-        let logits = accumulator.finish();
-        let scores = to_probabilities(&logits, self.cfg().task);
-        let predicted = match self.cfg().chunk_votes {
-            Some(min_chunks) => decide_by_votes(&votes, &scores, self.cfg().task, min_chunks),
-            None => decode_against_background(&scores, self.cfg().task, self.cfg().background),
-        };
+        Ok(self.finish_fold(fold))
+    }
 
-        // Keep only the evidence for labels the document actually got.
-        let mut evidence: Vec<Evidence> = predicted
-            .iter()
-            .flat_map(|&l| evidence.get(l).cloned().unwrap_or_default())
-            .collect();
-        evidence.sort_by(|a, b| b.score.total_cmp(&a.score));
-        evidence.truncate(self.evidence_limit);
+    /// Classify many documents together, one [`Prediction`] each, in order.
+    ///
+    /// Each prediction is the one [`Self::classify`] gives that document alone.
+    /// What changes is how the work is laid out: every document is chunked
+    /// first, and chunks from all of them share forward passes, shortest
+    /// first, so a column of short texts costs a few passes rather than one
+    /// each. A forward pass has a large fixed cost on a GPU, which for a short
+    /// text is nearly all of it.
+    ///
+    /// Passes hold at most [`MANY_MAX_ROWS`] chunks and [`MANY_MAX_TOKENS`]
+    /// padded tokens; [`Self::with_batch_size`] does not apply here. Every
+    /// chunk's logits are kept until the end, so memory grows with the total
+    /// number of chunks (a few floats each) — this is for many documents of
+    /// ordinary length, and an unbounded one belongs in
+    /// [`Self::classify_stream`].
+    ///
+    /// ```no_run
+    /// # use burn_setfit::Classifier;
+    /// # fn main() -> burn_setfit::Result<()> {
+    /// # let classifier = Classifier::from_bundle(&[], Default::default())?;
+    /// let cells = ["Refund please", "Where is my parcel?", "Love the new app"];
+    /// for (cell, prediction) in cells.iter().zip(classifier.classify_many(&cells)?) {
+    ///     println!("{cell}: {:?}", prediction.labels(classifier.manifest()));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn classify_many(&self, texts: &[&str]) -> Result<Vec<Prediction>> {
+        blocking("classifying documents", self.classify_many_async(texts))
+    }
 
-        Ok(Prediction {
-            scores,
-            predicted,
-            chunks_seen: accumulator.count(),
-            evidence,
-        })
+    /// [`Self::classify_many`], awaiting the device instead of blocking on it.
+    pub async fn classify_many_async(&self, texts: &[&str]) -> Result<Vec<Prediction>> {
+        // Chunk everything first, remembering whose each chunk is. Documents
+        // are chunked in order, so each one's chunks stay in document order.
+        let mut chunks: Vec<Chunk> = Vec::new();
+        let mut owner: Vec<usize> = Vec::new();
+        for (doc, text) in texts.iter().enumerate() {
+            let source = core::iter::once((*text).to_string());
+            for chunk in Chunker::new(source, &self.tokenizer, self.cfg().chunk) {
+                chunks.push(chunk?);
+                owner.push(doc);
+            }
+        }
+
+        let lengths: Vec<usize> = chunks.iter().map(|c| c.ids.len()).collect();
+        let mut rows: Vec<Vec<f32>> = vec![Vec::new(); chunks.len()];
+        for pass in plan_passes(&lengths, MANY_MAX_ROWS, MANY_MAX_TOKENS) {
+            let sequences: Vec<Vec<u32>> = pass.iter().map(|&i| chunks[i].ids.clone()).collect();
+            let longest = pass.iter().map(|&i| lengths[i]).max().unwrap_or(0);
+            let pad_len = bucket_len(longest).min(self.cfg().chunk.max_tokens);
+            let pass_rows = self.forward_sequences(&sequences, pad_len).await?;
+            for (&i, row) in pass.iter().zip(pass_rows) {
+                rows[i] = row;
+            }
+        }
+
+        // Fold in chunk order, which is each document's own order, so every
+        // accumulator sees exactly the sequence `classify` would feed it.
+        let mut folds: Vec<DocFold> = texts.iter().map(|_| self.new_fold()).collect();
+        for ((chunk, row), &doc) in chunks.iter().zip(&rows).zip(&owner) {
+            self.fold_row(&mut folds[doc], chunk, row);
+        }
+        Ok(folds.into_iter().map(|f| self.finish_fold(f)).collect())
     }
 
     /// Classify each passage on its own, without reducing to a document verdict.
@@ -453,9 +512,19 @@ impl Classifier {
     /// and the per-chunk one so they cannot disagree about what a chunk scores.
     async fn forward_rows(&self, batch: &[Chunk]) -> Result<Vec<Vec<f32>>> {
         let sequences: Vec<Vec<u32>> = batch.iter().map(|c| c.ids.clone()).collect();
-        let (input_ids, attention_mask) = pad_batch(
-            &sequences,
+        self.forward_sequences(&sequences, 0).await
+    }
+
+    /// [`Self::forward_rows`] on token sequences, padded to at least `pad_len`.
+    async fn forward_sequences(
+        &self,
+        sequences: &[Vec<u32>],
+        pad_len: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let (input_ids, attention_mask) = pad_batch_to(
+            sequences,
             self.tokenizer.special_tokens().pad,
+            pad_len,
             &self.device,
         );
 
@@ -467,26 +536,68 @@ impl Classifier {
     }
 
     /// Encode one batch of chunks and fold their scores in.
-    async fn run_batch(
-        &self,
-        batch: &[Chunk],
-        accumulator: &mut DocAccumulator,
-        evidence: &mut [Vec<Evidence>],
-        votes: &mut [usize],
-    ) -> Result<()> {
+    async fn run_batch(&self, batch: &[Chunk], fold: &mut DocFold) -> Result<()> {
         let rows = self.forward_rows(batch).await?;
         for (chunk, row) in batch.iter().zip(&rows) {
-            accumulator.push(chunk.token_count as f32, row);
-            self.record_evidence(chunk, row, evidence);
-            // The same decode `classify_chunks` reports per row, so a vote is
-            // exactly a row whose `predicted` names the label.
-            let scores = to_probabilities(row, self.cfg().task);
-            for label in decode_against_background(&scores, self.cfg().task, self.cfg().background)
-            {
-                votes[label] += 1;
-            }
+            self.fold_row(fold, chunk, row);
         }
         Ok(())
+    }
+
+    /// An empty fold for one document.
+    fn new_fold(&self) -> DocFold {
+        let num_labels = self.cfg().num_labels();
+        DocFold {
+            accumulator: DocAccumulator::new(
+                self.cfg().reducer,
+                self.cfg().hierarchy_fanout,
+                num_labels,
+            ),
+            evidence: vec![Vec::new(); num_labels],
+            votes: vec![0; num_labels],
+        }
+    }
+
+    /// Fold one chunk's logits into its document.
+    fn fold_row(&self, fold: &mut DocFold, chunk: &Chunk, row: &[f32]) {
+        fold.accumulator.push(chunk.token_count as f32, row);
+        self.record_evidence(chunk, row, &mut fold.evidence);
+        // The same decode `classify_chunks` reports per row, so a vote is
+        // exactly a row whose `predicted` names the label.
+        let scores = to_probabilities(row, self.cfg().task);
+        for label in decode_against_background(&scores, self.cfg().task, self.cfg().background) {
+            fold.votes[label] += 1;
+        }
+    }
+
+    /// Decode a document once every chunk is folded in.
+    fn finish_fold(&self, fold: DocFold) -> Prediction {
+        let DocFold {
+            accumulator,
+            evidence,
+            votes,
+        } = fold;
+        let logits = accumulator.finish();
+        let scores = to_probabilities(&logits, self.cfg().task);
+        let predicted = match self.cfg().chunk_votes {
+            Some(min_chunks) => decide_by_votes(&votes, &scores, self.cfg().task, min_chunks),
+            None => decode_against_background(&scores, self.cfg().task, self.cfg().background),
+        };
+
+        // Keep only the evidence for labels the document actually got.
+        let mut evidence: Vec<Evidence> = predicted
+            .iter()
+            .flat_map(|&l| evidence.get(l).cloned().unwrap_or_default())
+            .collect();
+        evidence.sort_by(|a, b| b.score.total_cmp(&a.score));
+        evidence.truncate(self.evidence_limit);
+
+        Prediction {
+            scores,
+            predicted,
+            chunks_seen: accumulator.count(),
+            evidence,
+        }
     }
 
     /// Record this chunk against every label it scores well on.
@@ -564,6 +675,48 @@ impl Classifier {
 
         Ok(data.chunks(dim).map(<[f32]>::to_vec).collect())
     }
+}
+
+/// What one document's chunks fold into, until it is decoded.
+struct DocFold {
+    accumulator: DocAccumulator,
+    /// Tracked per label, because which label matters is not known until the
+    /// document is fully reduced. Bounded at limit x labels either way.
+    evidence: Vec<Vec<Evidence>>,
+    /// Chunks that predict each label on their own, for `chunk_votes`.
+    votes: Vec<usize>,
+}
+
+/// [`LENGTH_BUCKET`]-rounded length of a pass whose longest sequence is
+/// `longest` tokens.
+fn bucket_len(longest: usize) -> usize {
+    longest.max(1).div_ceil(LENGTH_BUCKET) * LENGTH_BUCKET
+}
+
+/// Group sequence indices into forward passes, shortest first, each holding at
+/// most `max_rows` sequences and at most `max_tokens` padded tokens (rows × the
+/// pass's [`bucket_len`]). A sequence too long to share a pass gets its own.
+///
+/// Sorting is what keeps padding down: one long window padded together with
+/// many short ones makes every row cost what the long one does.
+fn plan_passes(lengths: &[usize], max_rows: usize, max_tokens: usize) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    // Stable, so equal lengths keep their order and a run is reproducible.
+    order.sort_by_key(|&i| lengths[i]);
+    let mut passes: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for i in order {
+        // Sorted, so this sequence is the longest the pass would hold.
+        let padded = (current.len() + 1) * bucket_len(lengths[i]);
+        if !current.is_empty() && (current.len() == max_rows.max(1) || padded > max_tokens) {
+            passes.push(core::mem::take(&mut current));
+        }
+        current.push(i);
+    }
+    if !current.is_empty() {
+        passes.push(current);
+    }
+    passes
 }
 
 /// Logits to probabilities, in the space the task mode implies.
@@ -737,5 +890,49 @@ fn decode_plain(scores: &[f32], task: TaskMode) -> Vec<usize> {
             .filter(|(_, s)| **s >= threshold)
             .map(|(i, _)| i)
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_len_rounds_up_to_the_bucket() {
+        assert_eq!(bucket_len(0), LENGTH_BUCKET);
+        assert_eq!(bucket_len(1), 8);
+        assert_eq!(bucket_len(16), 16);
+        assert_eq!(bucket_len(17), 24);
+    }
+
+    #[test]
+    fn passes_are_planned_shortest_first_and_cover_everything_once() {
+        let lengths = [30, 5, 200, 5, 12, 90, 7];
+        let passes = plan_passes(&lengths, 3, usize::MAX);
+        let flat: Vec<usize> = passes.iter().flatten().copied().collect();
+        let mut sorted = flat.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..lengths.len()).collect::<Vec<_>>());
+        assert!(flat.windows(2).all(|w| lengths[w[0]] <= lengths[w[1]]));
+        assert!(passes.iter().all(|p| p.len() <= 3));
+    }
+
+    #[test]
+    fn passes_are_bounded_by_padded_tokens() {
+        let lengths = [256; 40];
+        for pass in plan_passes(&lengths, 64, 4096) {
+            assert!(pass.len() * 256 <= 4096);
+        }
+    }
+
+    #[test]
+    fn a_sequence_too_long_for_the_budget_gets_a_pass_of_its_own() {
+        assert_eq!(plan_passes(&[256], 64, 100), vec![vec![0]]);
+        assert_eq!(plan_passes(&[8, 256], 64, 100), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn a_zero_row_cap_still_makes_progress() {
+        assert_eq!(plan_passes(&[5, 5], 0, usize::MAX), vec![vec![0], vec![1]]);
     }
 }
