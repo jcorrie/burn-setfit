@@ -82,9 +82,11 @@ counts, not by weight values. What it found, on a 4-core x86 sandbox:
   from 8 to 16; ndarray on the x86 sandbox gains nothing. The forward table
   argues for a default above 8 on a GPU, but end-to-end `classify` does not
   follow it: 249, 264 and 272 ms at batch 8, 16 and 32 for 37 chunks, so the
-  default stays at 8. The table pads nothing and runs exactly 256 tokens;
-  classify's batches are padded to odd lengths like 237 or 251. The rows at
-  248 and 251 tokens test whether that is the gap.
+  default stays at 8. The gap was alignment: classify padded each batch to
+  its longest chunk, an odd length, and on Metal 16 x 251 tokens took 144 ms
+  against 76 ms for 16 x 248. Batches are now padded to a multiple of
+  `LENGTH_BUCKET` (8); whether that makes a larger default worth having is
+  the next classify run's question.
 - **On an M5, Metal is ~3x `flex`, and `flex` is ~13x the x86 sandbox.**
   Long-document classify: 6.8 ms/chunk on Metal, 15.9 on `flex`. A body step:
   86 ms on Metal, 203 on `flex`. The first non-autodiff forward on Metal costs
